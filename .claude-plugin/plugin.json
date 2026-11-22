@@ -1,0 +1,20 @@
+{
+  "name": "headway",
+  "version": "0.1.0",
+  "description": "A live progress pane for Claude Code: plans, steps, subagents and your other sessions, as progress bars that follow scope changes.",
+  "author": {
+    "name": "David Mays",
+    "url": "https://github.com/dimays"
+  },
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "keywords": [
+    "progress",
+    "project-management",
+    "dashboard",
+    "pane",
+    "subagents"
+  ],
+  "homepage": "https://github.com/dimays/headway",
+  "repository": "https://github.com/dimays/headway"
+}

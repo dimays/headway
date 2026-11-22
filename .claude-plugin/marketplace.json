@@ -1,0 +1,14 @@
+{
+  "name": "headway",
+  "description": "Headway: a live progress pane for Claude Code sessions.",
+  "owner": {
+    "name": "David Mays",
+    "url": "https://github.com/dimays"
+  },
+  "plugins": [
+    {
+      "name": "headway",
+      "source": "./"
+    }
+  ]
+}
