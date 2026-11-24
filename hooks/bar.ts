@@ -1,56 +1,63 @@
 // Progress bars as markup: an SVG pill for surfaces that draw SVG, a line of
 // box-drawing characters for the terminal. Pure functions, so tests can read them.
 
-import type { Progress } from './plan'
+/**
+ * What a bar shows, as fractions of its width: `done` is measured progress
+ * (finished steps, reported percent), `estimate` a further pale stretch that
+ * is only a guess from elapsed time.
+ */
+export type BarSpec = {
+  done: number
+  estimate: number
+  isComplete: boolean
+  tone?: 'normal' | 'warning' | 'error'
+}
 
 // Colours that read on light and dark backgrounds alike.
 const TRACK = 'rgba(127,127,127,0.20)'
-const FILL = '#D97757' // Claude's coral
-const FILL_DONE = '#3E9E6B' // turns green once every step is done
-const ACTIVE_OPACITY = 0.35
+const FILL = { normal: '#D97757', warning: '#D4A03A', error: '#D9534F' } as const
+const FILL_DONE = '#3E9E6B' // green once every step is done
+const ESTIMATE_OPACITY = 0.35
 
-function pct(n: number, total: number): string {
-  return total === 0 ? '0' : ((n / total) * 100).toFixed(2)
+const clamp = (n: number) => Math.min(1, Math.max(0, n))
+const pct = (n: number) => (clamp(n) * 100).toFixed(2)
+
+function escape(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 /**
- * A rounded pill: the track, then the step in progress as a pale extension,
- * then the completed part on top. Widths are percentages, so the pill fills
- * whatever width the surface gives it without stretching its rounded ends.
+ * A rounded pill: the track, the estimate as a pale extension, the measured
+ * part on top. Widths are percentages, so the pill fills whatever width the
+ * surface gives it without stretching its rounded ends. A `title` becomes the
+ * hover tooltip where the surface draws the SVG interactively.
  */
-export function barSvg(p: Progress, height: number): string {
+export function barSvg(spec: BarSpec, height: number, title?: string): string {
   const r = height / 2
-  const complete = p.total > 0 && p.done === p.total
-  const fill = complete ? FILL_DONE : FILL
-  const reach = pct(p.done + p.active, p.total)
-  const done = pct(p.done, p.total)
-  const pill = (width: string, extra: string) =>
-    `<rect x="0" y="0" width="${width}%" height="${height}" rx="${r}" ry="${r}" ${extra}/>`
+  const fill = spec.isComplete ? FILL_DONE : FILL[spec.tone ?? 'normal']
+  const done = clamp(spec.done)
+  const reach = clamp(spec.done + spec.estimate)
+  const pill = (width: number, extra: string) =>
+    width <= 0 ? '' : `<rect x="0" y="0" width="${pct(width)}%" height="${height}" rx="${r}" ry="${r}" ${extra}/>`
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="${height}">`,
+    title ? `<title>${escape(title)}</title>` : '',
     `<rect x="0" y="0" width="100%" height="${height}" rx="${r}" ry="${r}" fill="${TRACK}"/>`,
-    p.active > 0 ? pill(reach, `fill="${fill}" fill-opacity="${ACTIVE_OPACITY}"`) : '',
-    p.done > 0 ? pill(done, `fill="${fill}"`) : '',
+    reach > done ? pill(reach, `fill="${fill}" fill-opacity="${ESTIMATE_OPACITY}"`) : '',
+    pill(done, `fill="${fill}"`),
     `</svg>`,
   ].join('')
 }
 
-export function barAlt(p: Progress): string {
-  if (p.total === 0) return 'No steps yet'
-  return `${p.done} of ${p.total} steps done${p.active > 0 ? `, ${p.active} in progress` : ''}`
-}
-
-/** The terminal's bar: heavy line for done, light for the rest. */
-export function barText(p: Progress, width: number): { done: string; active: string; rest: string } {
+/** The terminal's bar: heavy line for done, a dotted stretch for the estimate, light for the rest. */
+export function barText(spec: BarSpec, width: number): { done: string; estimate: string; rest: string } {
   const cells = Math.max(4, width)
-  if (p.total === 0) return { done: '', active: '', rest: '─'.repeat(cells) }
-  const done = Math.round((p.done / p.total) * cells)
-  const active = Math.min(cells - done, p.active > 0 ? Math.max(1, Math.round((p.active / p.total) * cells)) : 0)
-  return { done: '━'.repeat(done), active: '━'.repeat(active), rest: '─'.repeat(cells - done - active) }
+  const done = Math.round(clamp(spec.done) * cells)
+  const estimate = Math.min(cells - done, Math.round(clamp(spec.estimate) * cells))
+  return { done: '━'.repeat(done), estimate: '┅'.repeat(estimate), rest: '─'.repeat(cells - done - estimate) }
 }
 
-/** `6/7` and ` 86%`, the percent padded so a column of them lines up. */
-export function labels(p: Progress): { count: string; percent: string } {
-  if (p.total === 0) return { count: '', percent: '' }
-  return { count: `${p.done}/${p.total}`, percent: `${Math.round(p.ratio * 100)}%`.padStart(4, ' ') }
+/** `86%`, padded with figure spaces so a column of them lines up. */
+export function percent(fraction: number): string {
+  return `${Math.round(clamp(fraction) * 100)}%`.padStart(4, ' ')
 }

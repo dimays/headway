@@ -1,48 +1,126 @@
 import { atom, read } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, Board, Plan, SessionSummary, Step } from '../types'
+import type {
+  Activity,
+  AgentRow,
+  BgTask,
+  Board,
+  Health,
+  Intervention,
+  InterventionKind,
+  Plan,
+  SessionSummary,
+  Step,
+  View,
+} from '../types'
 import {
   EMPTY_PLAN,
   ENDED,
   activeStep,
+  applyReport,
   applyTodoWrite,
   applyUpdatePlan,
   applyWrapUp,
   progress,
+  toReport,
 } from './plan'
-import type { Progress } from './plan'
-import { barAlt, barSvg, barText, labels } from './bar'
+import {
+  HEALTH,
+  ago,
+  duration,
+  expectedStep,
+  health,
+  isWaitingOnYou,
+  lastActivity,
+  planEta,
+  planFraction,
+  range,
+  stepFraction,
+  stepRemainingMs,
+  worst,
+} from './eta'
+import type { Eta } from './eta'
+import { barSvg, barText, percent } from './bar'
+import type { BarSpec } from './bar'
+import { INTERVENTION_LABEL, describeCall, describeScope, interventionText } from './describe'
 
 const PANE = 'headway'
 const TITLE = 'Headway'
 const MAIN = 'main'
 const UPDATE_PLAN = 'mcp__ccd_turn__update_plan'
 const WRAP_UP = 'mcp__ccd_turn__wrap_up'
+const REPORT = 'mcp__headway__report_progress'
 const STORE_PREFIX = 'session:'
-const STALE_MS = 15 * 60 * 1000
-const FORGET_MS = 7 * 24 * 60 * 60 * 1000
+const STALE_MS = 15 * 60_000
+const FORGET_MS = 7 * 24 * 60 * 60_000
+const TASK_QUIET_MS = 5 * 60_000
+/** A note for a running loop that has made no tool call this long goes as a message instead. */
+const NEXT_STEP_PATIENCE_MS = 60_000
+const TAIL_LIMIT = 256 * 1024
+/** The tooltip card: a soft charcoal, fully opaque so nothing beneath shows through; rounded; readable in light and dark. */
+const TIP = { background: '#34332F', border: '#4A4844', text: '#F4F2EE' } as const
+
 
 // The shape tag versions what is stored: a reload that changes Board's fields
 // bumps it, and a value stored under an older tag is declined, not misdrawn.
-const SHAPE = 'board-1'
+const SHAPE = 'board-2'
 const BOARD = { plugin: 'headway', key: 'board' } as const
 const OTHERS = { plugin: 'headway', key: 'others' } as const
-const EMPTY_BOARD: Board = { plans: {}, agents: [] }
+const VIEW = { plugin: 'headway', key: 'view' } as const
+const EMPTY_BOARD: Board = { plans: {}, agents: [], activity: [], tasks: [], interventions: [], turn: { running: false } }
+const EMPTY_VIEW: View = { open: [] }
 // What the pane reads while drawing: atoms subscribe the pane to each write.
 const boardAtom = atom(BOARD, EMPTY_BOARD, { shape: SHAPE })
 const othersAtom = atom(OTHERS, [])
+const viewAtom = atom(VIEW, EMPTY_VIEW)
+
+const PROMPT_SECTION = [
+  'Headway, a progress pane beside this chat, shows the user your plan, each step and how long it is taking.',
+  'When a step has distinct parts, when you finish a meaningful part, when you can estimate the time left, or when you are blocked, call the report_progress tool (mcp__headway__report_progress) with the step, its sub-steps and their status, a rough percent and minutes left.',
+  'Keep reports short and skip them for trivial steps.',
+  'Text that begins "The user sent this from the Headway progress pane" is the user\'s own instruction, sent while you work: act on it.',
+].join(' ')
+
+const REPORT_SCHEMA = {
+  type: 'object',
+  properties: {
+    step: { type: 'string', description: 'The plan step this is about, as written in the plan. Defaults to the step in progress.' },
+    subSteps: {
+      type: 'array',
+      description: 'The parts of this step, in order, each with its status.',
+      items: {
+        type: 'object',
+        properties: {
+          content: { type: 'string' },
+          status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+        },
+        required: ['content', 'status'],
+      },
+    },
+    percent: { type: 'number', description: 'Rough percent of this step done, 0–100.' },
+    etaMinutes: { type: 'number', description: 'Rough minutes left on this step.' },
+    blocker: { type: 'string', description: 'What is blocking the step, or an empty string once unblocked.' },
+    note: { type: 'string', description: 'One line on what is happening now.' },
+  },
+} as const
+
+// ── State helpers ────────────────────────────────────────────────────────
+
+function asBoard(value: { shape: string; value: Board } | undefined): Board {
+  return value && value.shape === SHAPE ? { ...EMPTY_BOARD, ...value.value } : EMPTY_BOARD
+}
 
 async function getBoard($: EngineInterface): Promise<Board> {
   const { value } = await $.state.get(BOARD)
-  return value && value.shape === SHAPE ? value.value : EMPTY_BOARD
+  return asBoard(value)
 }
 
 /** Read-modify-write with a version check, retried if another hook wrote first. */
 async function changeBoard($: EngineInterface, change: (b: Board) => Board) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     const held = await $.state.get(BOARD)
-    const before = held.value && held.value.shape === SHAPE ? held.value.value : EMPTY_BOARD
+    const before = asBoard(held.value)
     const after = change(before)
     if (after === before) return
     const { isSet } = await $.state.set(BOARD, { shape: SHAPE, value: after }, { ifVersion: held.version })
@@ -50,32 +128,14 @@ async function changeBoard($: EngineInterface, change: (b: Board) => Board) {
   }
 }
 
-function basename(path: string): string {
-  return path.replace(/\/+$/, '').split('/').pop() || path
+async function changeView($: EngineInterface, change: (v: View) => View) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const held = await $.state.get(VIEW)
+    const before = held.value && Array.isArray(held.value.open) ? held.value : EMPTY_VIEW
+    const { isSet } = await $.state.set(VIEW, change(before), { ifVersion: held.version })
+    if (isSet) return
+  }
 }
-
-function ago(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000))
-  if (s < 60) return `${s}s ago`
-  const m = Math.round(s / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.round(m / 60)
-  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`
-}
-
-const AGENT_MARK: Record<string, string> = {
-  pending: '○',
-  running: '◐',
-  waiting: '◷',
-  idle: '·',
-  completed: '✓',
-  failed: '✗',
-  killed: '■',
-}
-
-// Module variables start over on each reload; that is fine for these.
-let lastPublished = ''
-let lastOthers = ''
 
 async function setPlan($: EngineInterface, loop: string, change: (p: Plan) => Plan) {
   await changeBoard($, b => {
@@ -84,6 +144,26 @@ async function setPlan($: EngineInterface, loop: string, change: (p: Plan) => Pl
     return after === before ? b : { ...b, plans: { ...b.plans, [loop]: after } }
   })
 }
+
+let counter = 0
+function newId(now: number): string {
+  counter += 1
+  return `${now.toString(36)}-${counter.toString(36)}`
+}
+
+function basename(path: string): string {
+  return path.replace(/\/+$/, '').split('/').pop() || path
+}
+
+/** The step a loop is on: its own plan's, else (a subagent) the one it was spawned for. */
+function stepOf(b: Board, loop: string): string | undefined {
+  const own = activeStep(b.plans[loop])
+  if (own) return own
+  const row = b.agents.find(a => a.id === loop)
+  return row?.step
+}
+
+// ── Background work ──────────────────────────────────────────────────────
 
 /** Mirrors subagent statuses from the engine, which is their source of truth. */
 async function refreshAgents($: EngineInterface) {
@@ -106,22 +186,94 @@ async function refreshAgents($: EngineInterface) {
         type: info.type,
         status: info.status,
         parentId: info.parentId,
+        step: stepOf(b, info.parentId ?? MAIN),
         startedAt: now,
       })
     }
-    return changed ? { ...b, agents: rows } : b
+    return changed ? { ...b, agents: rows.slice(-100) } : b
   })
 }
 
+/** Reads each running background command's output file: growth means it is alive. */
+async function refreshTasks($: EngineInterface) {
+  const b = await getBoard($)
+  const now = await $.clock.now()
+  const updates: Record<string, Partial<BgTask>> = {}
+  for (const task of b.tasks) {
+    if (task.status !== 'running') continue
+    if (task.kind === 'monitor' && task.timeoutMs && now - task.startedAt > task.timeoutMs) {
+      updates[task.id] = { status: 'completed', endedAt: task.startedAt + task.timeoutMs }
+      continue
+    }
+    if (!task.outputPath) continue
+    try {
+      const stat = await $.fs.stat(task.outputPath)
+      if (stat.size === task.bytes) continue
+      const patch: Partial<BgTask> = { bytes: stat.size, lastOutputAt: stat.mtimeMs }
+      if (stat.size <= TAIL_LIMIT) {
+        const text = await $.fs.read(task.outputPath)
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+        const last = lines[lines.length - 1]
+        if (last) patch.lastLine = last.slice(0, 160)
+      }
+      updates[task.id] = patch
+    } catch {
+      // The file may not exist yet, or was cleaned up; try again next tick.
+    }
+  }
+  if (Object.keys(updates).length === 0) return
+  await changeBoard($, board => ({
+    ...board,
+    tasks: board.tasks.map(t => (updates[t.id] ? { ...t, ...updates[t.id] } : t)),
+  }))
+}
+
+/** Sends what the pane queued, by the quickest route the target allows right now. */
+async function deliverPending($: EngineInterface) {
+  const b = await getBoard($)
+  const now = await $.clock.now()
+  for (const item of b.interventions) {
+    if (item.status !== 'pending') continue
+    if (item.target === MAIN) {
+      if (b.turn.running) continue // lands on the next tool result instead
+      await $.prompt.submit({ text: item.text })
+      await markIntervention($, item.id, { status: 'delivered', via: 'new-turn', deliveredAt: now })
+      continue
+    }
+    const agent = b.agents.find(a => a.id === item.target)
+    if (!agent) {
+      await markIntervention($, item.id, { status: 'failed', reason: 'That subagent is no longer known.' })
+      continue
+    }
+    const isBusy = agent.status === 'running' && now - item.at < NEXT_STEP_PATIENCE_MS
+    if (isBusy) continue
+    const sent = await $.session.send({ to: { agentId: agent.id }, text: item.text })
+    await markIntervention(
+      $,
+      item.id,
+      sent.isDelivered
+        ? { status: 'delivered', via: 'message', deliveredAt: now }
+        : { status: 'failed', reason: sent.reason },
+    )
+  }
+}
+
+async function markIntervention($: EngineInterface, id: string, patch: Partial<Intervention>) {
+  await changeBoard($, b => ({
+    ...b,
+    interventions: b.interventions.map(i => (i.id === id ? { ...i, ...patch } : i)),
+  }))
+}
+
 /** Publishes this session's summary to the shared store and reads everyone else's. */
-async function syncSessions($: EngineInterface) {
-  const id = await $.session.id()
+async function syncSessions($: EngineInterface, id: string) {
   const now = await $.clock.now()
   const b = await getBoard($)
   const main = b.plans[MAIN]
   const p = progress(main)
   if (p.total > 0) {
     const root = await $.session.root()
+    const eta = planEta(main, now)
     const mine: SessionSummary = {
       id,
       name: basename(root),
@@ -129,12 +281,17 @@ async function syncSessions($: EngineInterface) {
       done: p.done,
       total: p.total,
       active: activeStep(main),
+      health: sessionHealth(b, now),
+      eta: eta && { low: eta.low, high: eta.high, isRough: eta.isRough },
       agentsRunning: b.agents.filter(a => !ENDED.has(a.status) && a.status !== 'idle').length,
-      updatedAt: main?.updatedAt ?? now,
+      tasksRunning: b.tasks.filter(t => t.status === 'running').length,
+      steps: (main?.steps ?? []).slice(0, 20).map(s => ({ content: s.content, status: s.status })),
+      updatedAt: Math.max(main?.updatedAt ?? 0, lastActivity(b.activity, MAIN) ?? 0) || now,
     }
-    const text = JSON.stringify(mine)
-    if (text !== lastPublished) {
+    const text = JSON.stringify({ ...mine, updatedAt: 0, eta: mine.eta && [Math.round(mine.eta.low), Math.round(mine.eta.high)] })
+    if (text !== lastPublished || now - lastPublishedAt > 60_000) {
       lastPublished = text
+      lastPublishedAt = now
       await $.store.set(STORE_PREFIX + id, mine)
     }
   }
@@ -148,7 +305,7 @@ async function syncSessions($: EngineInterface) {
       await $.store.delete(key)
       continue
     }
-    list.push(one)
+    list.push({ ...one, steps: Array.isArray(one.steps) ? one.steps : [], health: one.health ?? 'on-track' })
   }
   list.sort((a, z) => z.updatedAt - a.updatedAt)
   const text = JSON.stringify(list)
@@ -158,20 +315,224 @@ async function syncSessions($: EngineInterface) {
   }
 }
 
+// Module variables start over on each reload; that is fine for these.
+let lastPublished = ''
+let lastPublishedAt = 0
+let lastOthers = ''
+let sessionId = ''
+
+// ── Health ───────────────────────────────────────────────────────────────
+
+function loopHealth(b: Board, loop: string, now: number): Health {
+  const plan = b.plans[loop]
+  const steps = plan?.steps ?? []
+  if (loop === MAIN && steps.length > 0 && steps.every(s => s.status === 'completed')) return 'done'
+  const agent = b.agents.find(a => a.id === loop)
+  if (agent?.status === 'failed') return 'failed'
+  if (agent && ENDED.has(agent.status)) return 'done'
+  const current = steps.find(s => s.status === 'in_progress')
+  const exp = expectedStep(plan)
+  return health({
+    now,
+    isRunning: loop === MAIN ? b.turn.running : agent?.status === 'running',
+    startedAt: current?.startedAt ?? agent?.startedAt,
+    expectedMs: exp.ms,
+    samples: exp.samples,
+    lastActivityAt: lastActivity(b.activity, loop) ?? agent?.startedAt ?? b.turn.startedAt,
+    needsYou: isWaitingOnYou(b.activity, loop),
+  })
+}
+
+function taskHealth(t: BgTask, now: number): Health {
+  if (t.status === 'failed') return 'failed'
+  if (t.status !== 'running') return 'done'
+  const last = t.lastOutputAt ?? t.startedAt
+  return t.kind === 'shell' && now - last > TASK_QUIET_MS ? 'quiet' : 'on-track'
+}
+
+function sessionHealth(b: Board, now: number): Health {
+  const loops = [MAIN, ...b.agents.filter(a => !ENDED.has(a.status)).map(a => a.id)]
+  return worst([...loops.map(l => loopHealth(b, l, now)), ...b.tasks.filter(t => t.status === 'running').map(t => taskHealth(t, now))])
+}
+
+// ── Interventions ────────────────────────────────────────────────────────
+
+type Target =
+  | { kind: 'loop'; loop: string; label: string }
+  | { kind: 'task'; task: BgTask }
+  | { kind: 'session'; summary: SessionSummary; label: string }
+
+async function intervene($: EngineInterface, kind: InterventionKind, target: Target, note = '') {
+  const now = await $.clock.now()
+  const id = newId(now)
+  const label = target.kind === 'task' ? target.task.description : target.label
+
+  if (target.kind === 'session') {
+    const text = interventionText(kind, label, note)
+    const sent = await $.session.send({ to: { sessionId: target.summary.id }, text })
+    await record($, {
+      id,
+      kind,
+      target: `session:${target.summary.id}`,
+      label: `${target.summary.name}: ${label}`,
+      text,
+      at: now,
+      ...(sent.isDelivered
+        ? { status: 'delivered' as const, via: 'message' as const, deliveredAt: now }
+        : { status: 'failed' as const, reason: sent.reason }),
+    })
+    return
+  }
+
+  if (target.kind === 'task') {
+    const task = target.task
+    if (kind === 'stop') {
+      const ran = await $.tool.call({ tool: 'TaskStop', task_id: task.id })
+      const failed = 'deny' in ran && ran.deny ? ran.deny : ran.isError ? ran.text ?? 'TaskStop failed.' : undefined
+      await record($, {
+        id,
+        kind,
+        target: task.id,
+        label,
+        text: '',
+        at: now,
+        ...(failed ? { status: 'failed' as const, reason: failed } : { status: 'delivered' as const, via: 'tool' as const, deliveredAt: now }),
+      })
+      if (!failed) {
+        await changeBoard($, b => ({
+          ...b,
+          tasks: b.tasks.map(t => (t.id === task.id ? { ...t, status: 'stopped', endedAt: now } : t)),
+        }))
+        await queue($, { id: newId(now), kind: 'stop', target: task.loop, label, text: interventionText('stop', label), at: now, status: 'pending' })
+      } else {
+        // The plugin was not allowed to stop it: ask the session to, by the same id.
+        await queue($, { id: newId(now), kind: 'stop', target: task.loop, label, text: interventionText('stop', label, `task id ${task.id}`), at: now, status: 'pending' })
+      }
+    } else {
+      const detail = kind === 'retry' ? `it ${task.status === 'failed' ? 'failed' : 'was stopped'}` : note
+      await queue($, { id, kind, target: task.loop, label, text: interventionText(kind, label, detail), at: now, status: 'pending' })
+    }
+    await deliverPending($)
+    return
+  }
+
+  const loop = target.loop
+  if (kind === 'stop') {
+    const ran = await $.tool.call({ tool: 'TaskStop', task_id: loop })
+    const failed = 'deny' in ran && ran.deny ? ran.deny : ran.isError ? ran.text ?? 'TaskStop failed.' : undefined
+    await record($, {
+      id,
+      kind,
+      target: loop,
+      label,
+      text: '',
+      at: now,
+      ...(failed ? { status: 'failed' as const, reason: failed } : { status: 'delivered' as const, via: 'tool' as const, deliveredAt: now }),
+    })
+    const parent = (await getBoard($)).agents.find(a => a.id === loop)?.parentId ?? MAIN
+    // Told either way: that it was stopped, or (when the plugin was not allowed) to stop it.
+    await queue($, {
+      id: newId(now),
+      kind: 'stop',
+      target: parent,
+      label,
+      text: interventionText('stop', label, failed ? `agent id ${loop}` : ''),
+      at: now,
+      status: 'pending',
+    })
+    await deliverPending($)
+    return
+  }
+
+  if (kind === 'next' || kind === 'defer' || kind === 'skip') {
+    const priority = kind === 'defer' ? 'deferred' : kind
+    await setPlan($, loop, p => ({
+      ...p,
+      steps: p.steps.map(s => (s.content === label ? { ...s, priority } : s)),
+    }))
+  }
+  await queue($, { id, kind, target: loop, label, text: interventionText(kind, label, note), at: now, status: 'pending' })
+  await deliverPending($)
+}
+
+async function queue($: EngineInterface, item: Intervention) {
+  await changeBoard($, b => ({ ...b, interventions: [...b.interventions, item].slice(-40) }))
+}
+
+async function record($: EngineInterface, item: Intervention) {
+  await queue($, item)
+}
+
+async function toggle($: EngineInterface, key: string) {
+  await changeView($, v => ({
+    ...v,
+    open: v.open.includes(key) ? v.open.filter(k => k !== key) : [...v.open, key].slice(-50),
+  }))
+}
+
+async function compose($: EngineInterface, key: string | undefined) {
+  await changeView($, v => ({ ...v, composing: key }))
+}
+
+async function sendNote($: EngineInterface, target: Target, key: string, note: string) {
+  const text = note.trim()
+  if (!text) return
+  await compose($, undefined)
+  await intervene($, 'context', target, text)
+  await $.ui.toast('Note sent to Headway’s queue')
+  void key
+}
+
+// ── Hooks ────────────────────────────────────────────────────────────────
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    sessionId = await $.session.id()
 
     await $.command.register({
       name: 'headway',
-      description: 'Show progress on this session’s plan, its subagents and your other sessions',
+      description: 'Show progress on this session’s plan, its subagents, background tasks and your other sessions',
+    })
+    await $.tool.register({
+      name: 'report_progress',
+      description:
+        'Report progress on a plan step to the Headway pane beside the chat: its sub-steps, a rough percent, minutes left, and any blocker. Cheap; call it when a step has parts, when a part finishes, or when blocked.',
+      inputSchema: REPORT_SCHEMA as unknown as Record<string, unknown>,
+      isDeferred: false,
     })
     void $.ui.open({ id: PANE, title: TITLE })
 
-    $.clock.every(3000, () => void refreshAgents($))
-    $.clock.every(5000, () => void syncSessions($))
+    $.clock.every(3000, () => {
+      void refreshAgents($)
+      void refreshTasks($)
+      void deliverPending($)
+    })
+    $.clock.every(5000, () => void syncSessions($, sessionId))
 
     return started
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    return { ...composed, sections: [...composed.sections, { id: 'headway', text: PROMPT_SECTION, scope: 'session' as const }] }
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) {
+      const now = await $.clock.now()
+      await changeBoard($, b => ({ ...b, turn: { running: true, startedAt: now } }))
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    if (!e.agentId) {
+      await changeBoard($, b => ({ ...b, turn: { running: false, startedAt: b.turn.startedAt } }))
+      await deliverPending($)
+    }
+    return done
   })
 
   on('command.run', { command: 'headway' }, async ($, e) => {
@@ -183,20 +544,96 @@ export const register: Register = on => {
     return { text: 'Headway pane opened. `/headway clear` resets this session’s board.' }
   })
 
-  // Task lists, captured as the model writes them: no extra model calls.
+  // Every tool call: the activity timeline, plans, background tasks, and the
+  // moment a queued note can ride along to the model as context.
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
-    if (ran.deny || ran.isError) return ran
-    if (e.tool !== UPDATE_PLAN && e.tool !== 'TodoWrite' && e.tool !== WRAP_UP) return ran
+    const loop = e.agentId ?? MAIN
+    const args = e as unknown as Record<string, unknown>
+    const startedAt = await $.clock.now()
+    const said = describeCall(e.tool, args)
+    const before = await getBoard($)
+    const act: Activity = {
+      id: e.tool_use_id,
+      loop,
+      tool: said.tool,
+      summary: said.summary,
+      step: stepOf(before, loop),
+      startedAt,
+      needsYou: e.tool === 'AskUserQuestion' ? true : undefined,
+    }
+    await changeBoard($, b => ({ ...b, activity: [...b.activity, act].slice(-400) }))
 
+    const ran = await next(e)
+    const at = await $.clock.now()
+    const failed = !!ran.deny || !!ran.isError
+    await changeBoard($, b => ({
+      ...b,
+      activity: b.activity.map(a => (a.id === act.id ? { ...a, endedAt: at, isError: failed || undefined, needsYou: undefined } : a)),
+    }))
+    if (ran.deny) return ran
+
+    if (!ran.isError) {
+      if (e.tool === UPDATE_PLAN) await setPlan($, loop, p => applyUpdatePlan(p, args, at))
+      else if (e.tool === 'TodoWrite') await setPlan($, loop, p => applyTodoWrite(p, args, at))
+      else if (e.tool === WRAP_UP) await setPlan($, loop, p => applyWrapUp(p, at))
+      await trackTask($, e.tool, args, ran.result as Record<string, unknown> | undefined, loop, at)
+    }
+
+    // A note queued for this loop goes to the model now, with this result.
+    const board = await getBoard($)
+    const due = board.interventions.filter(i => i.status === 'pending' && i.target === loop)
+    if (due.length === 0) return ran
+    const ids = new Set(due.map(i => i.id))
+    await changeBoard($, b => ({
+      ...b,
+      interventions: b.interventions.map(i => (ids.has(i.id) ? { ...i, status: 'delivered', via: 'next-step', deliveredAt: at } : i)),
+    }))
+    // The same result with the notes added as context: still this tool's own result type.
+    return { ...ran, context: [...(ran.context ?? []), ...due.map(i => i.text)] } as typeof ran
+  }).catch(($, e, next) => next(e)) // never block the call over a headway bug
+
+  on('tool.call', { tool: REPORT }, async ($, e) => {
     const loop = e.agentId ?? MAIN
     const at = await $.clock.now()
-    const args = e as unknown as Record<string, unknown>
-    if (e.tool === UPDATE_PLAN) await setPlan($, loop, p => applyUpdatePlan(p, args, at))
-    else if (e.tool === 'TodoWrite') await setPlan($, loop, p => applyTodoWrite(p, args, at))
-    else await setPlan($, loop, p => applyWrapUp(p, at))
-    return ran
-  }).catch(($, e, next) => next(e)) // never block the call over a headway bug
+    const report = toReport(e as unknown as Record<string, unknown>)
+    let matched: string | undefined
+    await setPlan($, loop, p => {
+      const applied = applyReport(p, report, at)
+      matched = applied.matched
+      return applied.plan
+    })
+    return {
+      result: matched
+        ? `Recorded on “${matched}”. The user sees it in the Headway pane.`
+        : 'No matching step: write your plan first (update_plan or TodoWrite), then report on a step of it.',
+    }
+  })
+
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const loop = (e as unknown as { agent_id?: string }).agent_id ?? MAIN
+    await changeBoard($, b => {
+      const open = [...b.activity].reverse().find(a => a.loop === loop && a.endedAt === undefined)
+      if (!open) return b
+      return { ...b, activity: b.activity.map(a => (a.id === open.id ? { ...a, needsYou: true } : a)) }
+    })
+    return next(e)
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    const result = await next(e)
+    const running = e.background_tasks
+    if (Array.isArray(running)) {
+      const live = new Set(running.map(t => t.id))
+      const now = await $.clock.now()
+      await changeBoard($, b => {
+        const gone = b.tasks.filter(t => t.status === 'running' && t.loop === MAIN && !live.has(t.id))
+        if (gone.length === 0) return b
+        const ids = new Set(gone.map(t => t.id))
+        return { ...b, tasks: b.tasks.map(t => (ids.has(t.id) ? { ...t, status: 'completed', endedAt: now } : t)) }
+      })
+    }
+    return result
+  })
 
   // Subagents, nested under the step their parent was on when it spawned them.
   on('agent.spawn', async ($, e, next) => {
@@ -206,228 +643,614 @@ export const register: Register = on => {
     const now = await $.clock.now()
     await changeBoard($, b => {
       if (b.agents.some(a => a.id === agentId)) return b
-      const parent = b.plans[e.parentAgentId ?? MAIN]
       const row: AgentRow = {
         id: agentId,
         description: e.description || e.subagentType,
         type: e.subagentType,
         status: 'running',
         parentId: e.parentAgentId,
-        step: activeStep(parent),
+        step: stepOf(b, e.parentAgentId ?? MAIN),
         startedAt: now,
       }
       return { ...b, agents: [...b.agents, row].slice(-100) }
     })
     return spawned
-  }).catch(($, e, next) => next(e)) // never block the call over a headway bug
+  }).catch(($, e, next) => next(e)) // never block the spawn over a headway bug
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
-    const { Box, Text } = table
-    // The terminal is the one surface without SVG; it gets a line of rules.
+    const { Box, Text, Button } = table
+    // The terminal is the one surface without SVG; it gets lines of rules and no ⓘ.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
+    const Input = 'Input' in table ? table.Input : undefined
     const b = await read($, boardAtom)
-    const stored = await read($, othersAtom)
-    const rest = Array.isArray(stored) ? stored : []
+    const storedOthers = await read($, othersAtom)
+    const others = Array.isArray(storedOthers) ? storedOthers : []
+    const storedView = await read($, viewAtom)
+    const view: View = storedView && Array.isArray(storedView.open) ? storedView : EMPTY_VIEW
     const now = await $.clock.now()
     const here = basename(await $.session.root())
     const columns = Math.max(24, e.props.bodyColumns ?? 40)
+    const isOpen = (key: string) => view.open.includes(key)
 
-    // ── Pieces ──────────────────────────────────────────────────────────
+    // ── Primitives ──────────────────────────────────────────────────────
 
-    const sectionLabel = (text: string) => (
-      <Text size="caption" weight="semibold" dimColor>
-        {text.toUpperCase()}
+    const sectionLabel = (text: string, aside?: string) => (
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text size="caption" weight="semibold" dimColor>
+          {text.toUpperCase()}
+        </Text>
+        {aside && (
+          <Text size="caption" dimColor>
+            {aside}
+          </Text>
+        )}
+      </Box>
+    )
+
+    const caption = (text: string, color?: string) => (
+      <Text size="caption" dimColor={!color} color={color} wrap="truncate-end">
+        {text}
       </Text>
     )
 
-    /** A rounded SVG pill where the surface draws SVG, a line of rules elsewhere. */
-    const bar = (p: Progress, height: number, width: number) => {
-      if (Svg) return <Svg source={barSvg(p, height)} alt={barAlt(p)} height={height} />
-      const t = barText(p, width)
-      const complete = p.total > 0 && p.done === p.total
+    // Tooltips. The trigger and its card sit in a keyed Box: a keyed Box is a
+    // hover scope, so the card shows the instant the pointer is over it, with
+    // no browser delay. The card is absolute, so it leaves the flow and showing
+    // it moves nothing. The engine places it against its parent (the keyed Box,
+    // as wide as the trigger's line) and paints it over what comes before it,
+    // while what comes after paints over it, so every card floats upward
+    // (bottom: 1 puts its lower edge at the top of the line) over the rows
+    // above. Its background is opaque. The terminal has no pointer, so it gets
+    // the trigger alone.
+    const pointer = e.surface !== 'terminal'
+    const tip = (key: string, trigger: ReturnType<typeof h>, text: string | undefined) =>
+      pointer && text ? (
+        <Box key={`tip:${key}`} flexDirection="column">
+          {trigger}
+          <Box
+            display="none"
+            hover={{ display: 'flex' }}
+            position="absolute"
+            bottom={1}
+            left={0}
+            right={0}
+            flexDirection="column"
+            paddingX="sm"
+            paddingY="xs"
+            borderStyle="round"
+            borderColor={TIP.border}
+            backgroundColor={TIP.background}
+          >
+            <Text size="caption" color={TIP.text} wrap="wrap">
+              {text}
+            </Text>
+          </Box>
+        </Box>
+      ) : (
+        trigger
+      )
+    /**
+     * A cue that the line it sits on explains itself on hover. The hover area
+     * is the whole line (see `tip` around the status and scope lines), so the
+     * card is as wide as the line, never as wide as this one glyph.
+     */
+    const infoIcon = () =>
+      pointer ? (
+        <Text size="caption" color="suggestion">
+          ⓘ
+        </Text>
+      ) : null
+
+    const bar = (spec: BarSpec, height: number) => {
+      if (Svg) return <Svg source={barSvg(spec, height)} alt={`${Math.round(spec.done * 100)}% done`} height={height} />
+      const t = barText(spec, columns - 2)
+      return textBar(spec, t)
+    }
+
+    /** A row's thin bar, the width of the row's text column. */
+    const rowBar = (spec: BarSpec) => {
+      if (Svg) return <Svg source={barSvg(spec, 4)} alt={`${Math.round((spec.done + spec.estimate) * 100)}%`} height={4} />
+      return textBar(spec, barText(spec, Math.max(8, columns - 8)))
+    }
+
+    const textBar = (spec: BarSpec, t: { done: string; estimate: string; rest: string }) => {
+      const color = spec.isComplete ? 'success' : spec.tone === 'error' ? 'error' : spec.tone === 'warning' ? 'warning' : 'claude'
       return (
         <Text>
-          <Text color={complete ? 'success' : 'claude'}>{t.done}</Text>
-          <Text color="claude" dimColor>
-            {t.active}
+          <Text color={color}>{t.done}</Text>
+          <Text color={color} dimColor>
+            {t.estimate}
           </Text>
           <Text color="subtle">{t.rest}</Text>
         </Text>
       )
     }
 
-    /** Title on the left, `6/7  86%` on the right, sharing one baseline. */
-    const header = (title: string, p: Progress, emphasis: 'semibold' | 'medium') => {
-      const l = labels(p)
+    const toneOf = (hl: Health): BarSpec['tone'] =>
+      hl === 'failed' || hl === 'needs-you' ? 'error' : hl === 'slow' || hl === 'quiet' ? 'warning' : 'normal'
+
+    const badge = (hl: Health) => (
+      <Box flexDirection="row" gap="xs" alignItems="center">
+        <Text size="footnote" color={HEALTH[hl].color} weight="medium">
+          ● {HEALTH[hl].label}
+        </Text>
+        {infoIcon()}
+      </Box>
+    )
+
+    type Action = { label: string; run: () => void; primary?: boolean }
+    /** At most two, and only the ones that make sense for the row's state. */
+    const actions = (key: string, list: Action[]) =>
+      list.length === 0 ? null : (
+        <Box flexDirection="row" gap="xs">
+          {list.slice(0, 2).map(a => (
+            <Button key={`${key}:${a.label}`} label={a.label} variant={a.primary ? 'primary' : 'secondary'} onPress={() => a.run()} />
+          ))}
+        </Box>
+      )
+
+    const composer = (key: string, target: Target, placeholder: string) =>
+      view.composing === key && Input ? (
+        <Input key={`note:${key}`} placeholder={placeholder} submitLabel="Send" rows={2} autoFocus onSubmit={value => void sendNote($, target, key, value)} />
+      ) : null
+
+    const toggleButton = (key: string) => (
+      <Button key={`toggle:${key}`} plain label={isOpen(key) ? '▾' : '▸'} onPress={() => void toggle($, key)} />
+    )
+
+    /** What a row's state means in a few words, when it is not simply fine. */
+    const problem = (hl: Health, startedAt: number | undefined, lastAt: number | undefined, typicalMs: number): string | undefined => {
+      if (hl === 'needs-you') return 'Waiting on you in the chat'
+      if (hl === 'quiet') return `Quiet for ${duration(now - (lastAt ?? startedAt ?? now))}`
+      if (hl === 'slow') return `Running ${duration(now - (startedAt ?? now))}, usually ~${duration(typicalMs)}`
+      if (hl === 'failed') return 'Failed'
+      return undefined
+    }
+
+    const timeline = (items: Activity[], since?: number) => {
+      if (items.length === 0) return caption('No tool calls yet.')
+      const shown = items.slice(-5)
       return (
-        <Box flexDirection="row" justifyContent="space-between" alignItems="flex-end" gap="sm">
-          <Box flexShrink={1}>
-            <Text weight={emphasis} wrap="truncate-end">
-              {title}
-            </Text>
+        <Box flexDirection="column">
+          {items.length > shown.length && caption(`${items.length - shown.length} earlier calls`)}
+          {shown.map(a => {
+            const offset = since !== undefined ? `+${duration(a.startedAt - since)}` : ago(now - a.startedAt)
+            const took = a.endedAt !== undefined ? duration(a.endedAt - a.startedAt) : '…'
+            const color = a.isError || a.needsYou ? 'error' : a.endedAt === undefined ? 'claude' : undefined
+            return (
+              <Box key={`act:${a.id}`} flexDirection="row" gap="sm">
+                <Text size="caption" mono dimColor>
+                  {offset.padStart(6, ' ')}
+                </Text>
+                <Box flexShrink={1} flexGrow={1} minWidth={0}>
+                  <Text size="caption" color={color} dimColor={!color} wrap="truncate-end">
+                    {a.tool}
+                    {a.summary ? ` · ${a.summary}` : ''}
+                  </Text>
+                </Box>
+                <Text size="caption" mono dimColor>
+                  {took}
+                </Text>
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+
+    /**
+     * A row: toggle and status mark, then one column holding the name (with
+     * its tag and time on the same line) and, under it, the bar. Every bar
+     * starts where the names start and runs to the right edge, so the bars line
+     * up without fixed widths, and text and bar never share a line.
+     */
+    const rowLine = (key: string, mark: string, markColor: string, name: string, opts: { strong?: boolean; faded?: boolean; tag?: string; mini?: BarSpec; miniTip?: string; right?: string }) => (
+      <Box flexDirection="row" gap="sm">
+        {toggleButton(key)}
+        <Text mono color={markColor}>
+          {mark}
+        </Text>
+        <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
+          <Box flexDirection="row" gap="sm" alignItems="center">
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text weight={opts.strong ? 'semibold' : 'regular'} dimColor={opts.faded} wrap="truncate-end">
+                {name}
+              </Text>
+            </Box>
+            {opts.tag && (
+              <Text size="caption" color="suggestion" weight="medium">
+                {opts.tag}
+              </Text>
+            )}
+            {opts.right && (
+              <Text size="caption" mono dimColor>
+                {opts.right}
+              </Text>
+            )}
           </Box>
-          {p.total > 0 && (
-            <Box flexDirection="row" gap="sm" flexShrink={0}>
-              <Text mono dimColor>
-                {l.count}
-              </Text>
-              <Text mono weight="semibold">
-                {l.percent}
-              </Text>
+          {opts.mini && tip(`bar:${key}`, rowBar(opts.mini), opts.miniTip)}
+        </Box>
+      </Box>
+    )
+
+    // ── Rows ────────────────────────────────────────────────────────────
+
+    const taskRow = (task: BgTask) => {
+      const key = `task:${task.id}`
+      const hl = taskHealth(task, now)
+      const running = task.status === 'running'
+      const mark = { running: '◐', completed: '✓', failed: '✗', stopped: '■' }[task.status]
+      const color = task.status === 'failed' ? 'error' : running ? (hl === 'quiet' ? 'warning' : 'claude') : 'subtle'
+      const elapsed = (task.endedAt ?? now) - task.startedAt
+      const target: Target = { kind: 'task', task }
+      const right = running ? duration(elapsed) : `${task.status} · ${duration(elapsed)}`
+      const quiet = running && hl === 'quiet' ? `No output for ${duration(now - (task.lastOutputAt ?? task.startedAt))}` : undefined
+      return (
+        <Box key={key} flexDirection="column">
+          {rowLine(key, mark, color, task.description, { faded: !running, right })}
+          {quiet ? caption(quiet, 'warning') : running && task.lastLine ? caption(task.lastLine) : null}
+          {isOpen(key) && (
+            <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+              {caption(`${task.kind} · started ${ago(now - task.startedAt)}${task.step ? ` during “${task.step}”` : ''}${task.bytes !== undefined ? ` · ${Math.round(task.bytes / 1024)} KB output` : ''}`)}
+              {!running && task.lastLine && caption(`Last output: ${task.lastLine}`)}
+              {actions(
+                key,
+                running
+                  ? [{ label: 'Stop', run: () => void intervene($, 'stop', target), primary: hl === 'quiet' }]
+                  : task.status === 'failed' || task.status === 'stopped'
+                    ? [{ label: 'Retry', run: () => void intervene($, 'retry', target) }]
+                    : [],
+              )}
             </Box>
           )}
         </Box>
       )
     }
 
-    const meta = (parts: (string | false | undefined)[]) => (
-      <Text size="caption" dimColor wrap="truncate-end">
-        {parts.filter(Boolean).join('  ·  ')}
-      </Text>
-    )
-
     const agentRow = (row: AgentRow): ReturnType<typeof h> => {
+      const key = `agent:${row.id}`
       const plan = b.plans[row.id]
       const p = progress(plan)
-      const mark = AGENT_MARK[row.status] ?? '?'
+      const hl = loopHealth(b, row.id, now)
       const ended = ENDED.has(row.status)
-      const color = row.status === 'failed' ? 'error' : ended ? 'subtle' : 'claude'
-      const children = b.agents.filter(a => a.parentId === row.id)
+      const mark = { pending: '○', running: '◐', waiting: '◷', idle: '·', completed: '✓', failed: '✗', killed: '■' }[row.status] ?? '?'
+      const color = row.status === 'failed' ? 'error' : ended ? 'subtle' : hl === 'on-track' ? 'claude' : HEALTH[hl].color
+      const elapsed = (row.endedAt ?? now) - row.startedAt
+      const target: Target = { kind: 'loop', loop: row.id, label: row.description }
+      const trouble = !ended ? problem(hl, row.startedAt, lastActivity(b.activity, row.id), expectedStep(plan).ms) : undefined
+      const stuck = hl === 'quiet' || hl === 'slow'
       return (
-        <Box key={`agent:${row.id}`} flexDirection="row" gap="sm">
-          <Text mono color={color}>
-            {mark}
-          </Text>
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} gap="xs">
-            <Box flexDirection="row" justifyContent="space-between" gap="sm">
-              <Box flexShrink={1}>
-                <Text size="footnote" dimColor={ended} wrap="truncate-end">
-                  {row.description}
-                </Text>
-              </Box>
-              <Text size="caption" dimColor>
-                {p.total > 0 ? `${labels(p).count}  ·  ${row.type}` : row.type}
-              </Text>
+        <Box key={key} flexDirection="column">
+          {rowLine(key, mark, color, row.description, {
+            faded: ended,
+            mini: p.total > 0 ? { done: planFraction(plan, now), estimate: 0, isComplete: p.done === p.total, tone: toneOf(hl) } : undefined,
+            miniTip: `${p.done} of ${p.total} of its own steps done${ended ? '' : `, running ${duration(elapsed)}`}.`,
+            right: `${row.type} · ${duration(elapsed)}`,
+          })}
+          {trouble && caption(trouble, HEALTH[hl].color)}
+          {isOpen(key) && (
+            <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+              {plan && plan.steps.length > 0 && (
+                <Box flexDirection="column">
+                  {plan.steps.map(s => (
+                    <Text key={`astep:${row.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                      {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                    </Text>
+                  ))}
+                </Box>
+              )}
+              {timeline(b.activity.filter(a => a.loop === row.id), row.startedAt)}
+              {b.tasks.filter(t => t.loop === row.id).map(t => taskRow(t))}
+              {b.agents.filter(a => a.parentId === row.id).map(child => agentRow(child))}
+              {!ended &&
+                actions(
+                  key,
+                  stuck
+                    ? [
+                        { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                        { label: 'Stop', run: () => void intervene($, 'stop', target) },
+                      ]
+                    : hl === 'needs-you'
+                      ? []
+                      : [{ label: 'Add context', run: () => void compose($, key) }],
+                )}
+              {composer(key, target, `Context for “${row.description}”…`)}
             </Box>
-            {p.total > 0 && bar(p, 4, columns - 8)}
-            {children.map(child => agentRow(child))}
-          </Box>
+          )}
         </Box>
       )
     }
 
-    const STEP_MARK = { completed: '✓', in_progress: '●', pending: '○' } as const
-    const STEP_COLOR = { completed: 'success', in_progress: 'claude', pending: 'subtle' } as const
+    const main = b.plans[MAIN]
+    const steps = main?.steps ?? []
+    const exp = expectedStep(main)
+    const mainH = loopHealth(b, MAIN, now)
 
     const stepRow = (step: Step) => {
-      const agents = b.agents.filter(a => !a.parentId && a.step === step.content)
+      const key = `step:${step.content}`
+      const f = stepFraction(step, now, exp.ms)
       const current = step.status === 'in_progress'
+      const hl: Health = current ? mainH : 'on-track'
+      const agents = b.agents.filter(a => !a.parentId && a.step === step.content)
+      const tasks = b.tasks.filter(t => t.step === step.content)
+      const acts = b.activity.filter(a => a.loop === MAIN && a.step === step.content)
+      const elapsed = step.startedAt !== undefined ? (step.completedAt ?? now) - step.startedAt : 0
+      const left = stepRemainingMs(step, now, exp.ms)
+      const target: Target = { kind: 'loop', loop: MAIN, label: step.content }
+      const mark = step.status === 'completed' ? '✓' : current ? '●' : '○'
+      const markColor = step.status === 'completed' ? 'success' : current ? (hl === 'on-track' || hl === 'idle' ? 'claude' : HEALTH[hl].color) : 'subtle'
+      const right =
+        step.status === 'completed'
+          ? elapsed > 0
+            ? duration(elapsed)
+            : 'done'
+          : current
+            ? `~${duration(left)} left`
+            : `~${duration(exp.ms)}`
+      const tag = step.priority === 'next' ? 'Up next' : step.priority === 'deferred' ? 'Deferred' : step.priority === 'skip' ? 'Skipping' : undefined
+      const subs = step.subSteps ?? []
+      const subsDone = subs.filter(s => s.status === 'completed').length
+      const trouble = current ? problem(hl, step.startedAt, lastActivity(b.activity, MAIN), exp.ms) : undefined
+      const summary = step.blocker
+        ? { text: `Blocked: ${step.blocker}`, color: 'error' }
+        : trouble
+          ? { text: trouble, color: HEALTH[hl].color }
+          : current && (subs.length > 0 || step.note)
+            ? { text: [subs.length > 0 && `${subsDone}/${subs.length} parts`, step.note].filter(Boolean).join(' · '), color: undefined }
+            : undefined
+      const nested = agents.length + tasks.length
+      const stepActions: Action[] = current
+        ? hl === 'needs-you'
+          ? []
+          : hl === 'slow'
+            ? [
+                { label: 'Wrap up', run: () => void intervene($, 'wrap', target), primary: true },
+                { label: 'Add context', run: () => void compose($, key) },
+              ]
+            : hl === 'quiet'
+              ? [
+                  { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                  { label: 'Add context', run: () => void compose($, key) },
+                ]
+              : [{ label: 'Add context', run: () => void compose($, key) }]
+        : step.status === 'pending'
+          ? [
+              { label: 'Do next', run: () => void intervene($, 'next', target) },
+              { label: 'Skip', run: () => void intervene($, 'skip', target) },
+            ]
+          : []
+      const pctWords = `${Math.round(f.value * 100)}%`
+      const barTip =
+        step.status === 'completed'
+          ? elapsed > 0
+            ? `Done in ${duration(elapsed)}.`
+            : 'Done.'
+          : step.status === 'pending'
+            ? `Not started. Steps here usually take ~${duration(exp.ms)}${exp.samples === 0 ? ' (a starting guess until one finishes)' : ''}.`
+            : f.isEstimated
+              ? `About ${pctWords}, estimated from time: ${duration(elapsed)} so far, and steps here usually take ~${duration(exp.ms)}. The session hasn't reported progress on this step.`
+              : step.percent !== undefined
+                ? `${pctWords}, as the session reported ${step.reportedAt ? ago(now - step.reportedAt) : 'it'}.`
+                : `${pctWords}: ${subsDone} of ${subs.length} parts done.`
       return (
-        <Box key={`step:${step.content}`} flexDirection="row" gap="sm">
-          <Text mono color={STEP_COLOR[step.status]}>
-            {STEP_MARK[step.status]}
-          </Text>
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} gap="xs">
-            <Text
-              weight={current ? 'semibold' : 'regular'}
-              dimColor={step.status === 'completed'}
-              wrap="truncate-end"
-            >
-              {step.content}
-            </Text>
-            {agents.length > 0 && (
-              <Box flexDirection="column" gap="xs">
-                {agents.map(row => agentRow(row))}
-              </Box>
-            )}
-          </Box>
+        <Box key={key} flexDirection="column">
+          {rowLine(key, mark, markColor, step.content, {
+            strong: current,
+            faded: step.status === 'completed',
+            tag,
+            mini: {
+              done: f.isEstimated ? 0 : f.value,
+              estimate: f.isEstimated ? f.value : 0,
+              isComplete: step.status === 'completed',
+              tone: current ? toneOf(hl) : 'normal',
+            },
+            miniTip: barTip,
+            right,
+          })}
+          {summary && caption(summary.text, summary.color)}
+          {!isOpen(key) && nested > 0 && caption([agents.length > 0 && `${agents.length} subagent${agents.length === 1 ? '' : 's'}`, tasks.length > 0 && `${tasks.length} background task${tasks.length === 1 ? '' : 's'}`].filter(Boolean).join(' · '))}
+          {isOpen(key) && (
+            <Box flexDirection="column" gap="sm" marginLeft="lg" marginTop="xs">
+              {subs.length > 0 && (
+                <Box flexDirection="column">
+                  {subs.map(s => (
+                    <Text key={`sub:${step.content}:${s.content}`} size="footnote" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                      {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                    </Text>
+                  ))}
+                </Box>
+              )}
+              {agents.map(a => agentRow(a))}
+              {tasks.map(t => taskRow(t))}
+              {step.status !== 'pending' && timeline(acts, step.startedAt)}
+              {actions(key, stepActions)}
+              {composer(key, target, `Context for “${step.content}”…`)}
+            </Box>
+          )}
         </Box>
       )
     }
 
     // ── This session ────────────────────────────────────────────────────
 
-    const main = b.plans[MAIN]
-    const steps = main?.steps ?? []
     const p = progress(main)
+    const frac = planFraction(main, now)
+    const eta = planEta(main, now)
+    const overall = sessionHealth(b, now)
+    const scope = describeScope(main, now)
     const stepNames = new Set(steps.map(s => s.content))
     const loose = b.agents.filter(a => !a.parentId && (!a.step || !stepNames.has(a.step)))
-    const changes = main?.changes ?? []
-    const first = changes[0]
-    const last = changes[changes.length - 1]
-    const delta = last ? last.added.length - last.removed.length : 0
-    const running = b.agents.filter(a => !ENDED.has(a.status) && a.status !== 'idle').length
+    const tasksRunning = b.tasks.filter(t => t.status === 'running')
+    const tasksShown = [...tasksRunning, ...b.tasks.filter(t => t.status !== 'running').slice(-3)]
+    const latest = [...b.interventions].reverse().find(i => i.status === 'pending' || now - (i.deliveredAt ?? i.at) < 2 * 60_000)
+    const measured = steps.reduce((sum, s) => {
+      const f = stepFraction(s, now, exp.ms)
+      return sum + (f.isEstimated ? 0 : f.value)
+    }, 0)
+    const spec: BarSpec = {
+      done: steps.length ? measured / steps.length : 0,
+      estimate: steps.length ? frac - measured / steps.length : 0,
+      isComplete: p.total > 0 && p.done === p.total,
+      tone: toneOf(overall),
+    }
+    const etaTip = (x: Eta) =>
+      (exp.samples > 0
+        ? `Time left: ${p.total - p.done} steps at ~${duration(exp.ms)} each, from ${exp.samples} finished.`
+        : `Time left assumes ~${duration(exp.ms)} a step until one finishes.`) + (x.isRough ? ' Rough until 3 finish.' : '')
+    const deliveredWords = (i: Intervention) =>
+      i.status === 'pending'
+        ? 'waiting for its next step'
+        : i.status === 'failed'
+          ? `not sent: ${i.reason ?? 'refused'}`
+          : i.via === 'next-step'
+            ? 'delivered at its next step'
+            : i.via === 'new-turn'
+              ? 'sent as a new message'
+              : i.via === 'tool'
+                ? 'done'
+                : 'sent as a message'
 
     const session = (
       <Box flexDirection="column" gap="sm">
         {sectionLabel('This session')}
         {steps.length === 0 ? (
-          <Text dimColor>No plan yet. It appears here as soon as the session writes its task list.</Text>
+          caption('No plan yet. It appears here as soon as the session writes its task list.')
         ) : (
           <Box flexDirection="column" gap="xs">
-            <Box key="summary" flexDirection="column" gap="xs">
-              {header(here, p, 'semibold')}
+            <Box key="summary" flexDirection="row" justifyContent="space-between" alignItems="flex-end" gap="sm">
+              <Box flexShrink={1}>
+                <Text weight="semibold" wrap="truncate-end">
+                  {here}
+                </Text>
+              </Box>
+              <Box flexDirection="row" gap="sm" flexShrink={0}>
+                <Text mono dimColor>
+                  {p.done}/{p.total}
+                </Text>
+                <Text mono weight="semibold">
+                  {percent(frac)}
+                </Text>
+              </Box>
             </Box>
-            {bar(p, 8, columns)}
-            {meta([
-              first && last && `Scope ${first.from} → ${steps.length}`,
-              last && `${delta >= 0 ? '+' : '−'}${Math.abs(delta)} last change`,
-              last ? `changed ${ago(now - last.at)}` : main && `updated ${ago(now - main.updatedAt)}`,
-              running > 0 && `${running} agent${running === 1 ? '' : 's'} running`,
-            ])}
+            <Box>
+              {tip(
+                'bar:main',
+                bar(spec, 8),
+                `${p.done} of ${p.total} steps done (${percent(frac).trim()} counting the step in progress).${spec.estimate > 0.005 ? ' The pale part is that step, estimated from time.' : ''}`,
+              )}
+            </Box>
+            {tip(
+              'status',
+              <Box key="status" flexDirection="row" justifyContent="space-between" alignItems="center" gap="sm">
+                {badge(overall)}
+                {eta && (
+                  <Box flexDirection="row" gap="xs" alignItems="center">
+                    <Text size="footnote" dimColor>
+                      {range(eta)} left{eta.isRough ? ' · rough' : ''}
+                    </Text>
+                    {infoIcon()}
+                  </Box>
+                )}
+              </Box>,
+              // Short: it floats up into the few rows above the line.
+              [`${HEALTH[overall].label}: ${HEALTH[overall].meaning}`, eta && etaTip(eta)].filter(Boolean).join(' '),
+            )}
+            {scope &&
+              tip(
+                'scope',
+                <Box key="scope" flexDirection="row" gap="xs" alignItems="center">
+                  <Box flexShrink={1} minWidth={0}>
+                    {caption(scope.headline)}
+                  </Box>
+                  {infoIcon()}
+                </Box>,
+                scope.detail.join(' '),
+              )}
+            {latest && caption(`${INTERVENTION_LABEL[latest.kind]} · ${latest.label} — ${deliveredWords(latest)}`, latest.status === 'failed' ? 'error' : undefined)}
           </Box>
         )}
       </Box>
     )
 
     const stepList = steps.length > 0 && (
-      <Box flexDirection="column" gap="sm">
+      <Box flexDirection="column" gap="xs">
         {sectionLabel('Steps')}
-        <Box flexDirection="column" gap="xs">
-          {steps.map(step => stepRow(step))}
-        </Box>
+        {steps.map(step => stepRow(step))}
       </Box>
     )
 
     const subagents = loose.length > 0 && (
-      <Box flexDirection="column" gap="sm">
+      <Box flexDirection="column" gap="xs">
         {sectionLabel('Subagents')}
-        <Box flexDirection="column" gap="xs">
-          {loose.map(row => agentRow(row))}
-        </Box>
+        {loose.map(row => agentRow(row))}
+      </Box>
+    )
+
+    const background = tasksShown.length > 0 && (
+      <Box flexDirection="column" gap="xs">
+        {sectionLabel('Background tasks', tasksRunning.length > 0 ? `${tasksRunning.length} running` : undefined)}
+        {tasksShown.map(t => taskRow(t))}
       </Box>
     )
 
     // ── Other sessions ──────────────────────────────────────────────────
 
     const othersBlock = (
-      <Box flexDirection="column" gap="sm">
+      <Box flexDirection="column" gap="xs">
         {sectionLabel('Other sessions')}
-        {rest.length === 0 ? (
-          <Text size="footnote" dimColor>
-            None reporting yet. Sessions with Headway installed show up here.
-          </Text>
+        {others.length === 0 ? (
+          caption('None reporting yet. Sessions started since Headway was installed show up here.')
         ) : (
-          <Box flexDirection="column" gap="md">
-            {rest.map(one => {
+          <Box flexDirection="column" gap="sm">
+            {others.map(one => {
+              const key = `session:${one.id}`
               const stale = now - one.updatedAt > STALE_MS
-              const op: Progress = {
-                done: one.done,
-                active: one.active ? 1 : 0,
-                total: one.total,
-                ratio: one.total === 0 ? 0 : one.done / one.total,
-              }
+              const hl: Health = stale && one.health !== 'done' ? 'idle' : one.health
+              const op: BarSpec = { done: one.total ? one.done / one.total : 0, estimate: 0, isComplete: one.total > 0 && one.done === one.total, tone: toneOf(hl) }
+              const target: Target = { kind: 'session', summary: one, label: one.active ?? one.name }
+              const stuck = hl === 'slow' || hl === 'quiet' || stale
               return (
-                <Box flexDirection="column" gap="xs">
-                  {header(one.name, op, 'medium')}
-                  {bar(op, 6, columns)}
-                  {meta([
-                    one.active,
-                    ago(now - one.updatedAt),
-                    one.agentsRunning > 0 && `${one.agentsRunning} agent${one.agentsRunning === 1 ? '' : 's'}`,
-                    stale && 'idle',
-                  ])}
+                <Box key={key} flexDirection="column" gap="xs">
+                  <Box flexDirection="row" gap="sm" alignItems="center">
+                    {toggleButton(key)}
+                    <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                      <Text weight="medium" wrap="truncate-end">
+                        {one.name}
+                      </Text>
+                    </Box>
+                    <Text mono dimColor>
+                      {one.done}/{one.total}
+                    </Text>
+                    <Text mono weight="semibold">
+                      {percent(op.done)}
+                    </Text>
+                  </Box>
+                  {tip(`bar:${key}`, bar(op, 6), `${one.done} of ${one.total} steps done · updated ${ago(now - one.updatedAt)}.`)}
+                  {caption(
+                    [HEALTH[hl].label, one.eta && `${range({ ...one.eta, ms: 0 })} left`, one.active].filter(Boolean).join(' · '),
+                    hl === 'on-track' || hl === 'done' || hl === 'idle' ? undefined : HEALTH[hl].color,
+                  )}
+                  {isOpen(key) && (
+                    <Box flexDirection="column" gap="xs" marginLeft="lg">
+                      {one.steps.map(s => (
+                        <Text key={`os:${one.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                          {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                        </Text>
+                      ))}
+                      {caption(`Updated ${ago(now - one.updatedAt)}${one.agentsRunning ? ` · ${one.agentsRunning} subagents` : ''}${one.tasksRunning ? ` · ${one.tasksRunning} background tasks` : ''}`)}
+                      {actions(
+                        key,
+                        stuck
+                          ? [
+                              { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                              { label: 'Add context', run: () => void compose($, key) },
+                            ]
+                          : [{ label: 'Add context', run: () => void compose($, key) }],
+                      )}
+                      {composer(key, target, `Context for ${one.name}…`)}
+                    </Box>
+                  )}
                 </Box>
               )
             })}
@@ -437,12 +1260,73 @@ export const register: Register = on => {
     )
 
     return (
-      <Box flexDirection="column" gap="lg" paddingX="xs" paddingY="xs">
+      <Box flexDirection="column" gap="lg" paddingX="xs" paddingY="xs" width="100%">
         {session}
         {stepList}
         {subagents}
+        {background}
         {othersBlock}
       </Box>
     )
   })
+}
+
+/** Starts tracking a background task the call just launched, or ends one it stopped. */
+async function trackTask(
+  $: EngineInterface,
+  tool: string,
+  args: Record<string, unknown>,
+  result: Record<string, unknown> | undefined,
+  loop: string,
+  at: number,
+) {
+  const s = (o: Record<string, unknown> | undefined, k: string) => (o && typeof o[k] === 'string' ? (o[k] as string) : undefined)
+  const b = await getBoard($)
+  const step = stepOf(b, loop)
+  let task: BgTask | undefined
+  if (tool === 'Bash' && s(result, 'backgroundTaskId')) {
+    task = {
+      id: s(result, 'backgroundTaskId')!,
+      kind: 'shell',
+      description: s(args, 'description') ?? s(args, 'command')?.slice(0, 80) ?? 'Background command',
+      loop,
+      step,
+      status: 'running',
+      startedAt: at,
+      outputPath: s(result, 'backgroundOutputPath'),
+    }
+  } else if (tool === 'Monitor' && s(result, 'taskId')) {
+    task = {
+      id: s(result, 'taskId')!,
+      kind: 'monitor',
+      description: s(args, 'description') ?? 'Monitor',
+      loop,
+      step,
+      status: 'running',
+      startedAt: at,
+      timeoutMs: typeof args.timeout_ms === 'number' ? args.timeout_ms : typeof result?.timeoutMs === 'number' ? (result.timeoutMs as number) : undefined,
+    }
+  } else if (tool === 'Workflow' && s(result, 'taskId')) {
+    task = {
+      id: s(result, 'taskId')!,
+      kind: 'workflow',
+      description: s(result, 'workflowName') ?? s(result, 'summary') ?? 'Workflow',
+      loop,
+      step,
+      status: 'running',
+      startedAt: at,
+    }
+  } else if (tool === 'TaskStop') {
+    const id = s(args, 'task_id') ?? s(args, 'shell_id')
+    if (id) {
+      await changeBoard($, board => ({
+        ...board,
+        tasks: board.tasks.map(t => (t.id === id && t.status === 'running' ? { ...t, status: 'stopped', endedAt: at } : t)),
+      }))
+    }
+    return
+  }
+  if (!task) return
+  const added = task
+  await changeBoard($, board => (board.tasks.some(t => t.id === added.id) ? board : { ...board, tasks: [...board.tasks, added].slice(-60) }))
 }

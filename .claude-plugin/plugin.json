@@ -1,7 +1,7 @@
 {
   "name": "headway",
-  "version": "0.1.0",
-  "description": "A live progress pane for Claude Code: plans, steps, subagents and your other sessions, as progress bars that follow scope changes.",
+  "version": "0.2.0",
+  "description": "A live progress pane for Claude Code: nested progress bars, ETAs and health for plans, steps, subagents, background tasks and your other sessions, with buttons to steer the work.",
   "author": {
     "name": "David Mays",
     "url": "https://github.com/dimays"
