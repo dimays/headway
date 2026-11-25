@@ -1,7 +1,7 @@
 // Pure logic: turning task-list tool calls into plans, and plans into numbers.
 // Nothing here touches `$`, so it is easy to test and to reason about.
 
-import type { Plan, ScopeChange, Step, StepStatus, SubStep } from '../types'
+import type { Plan, ScopeChange, Step, StepSize, StepStatus, SubStep } from '../types'
 
 export const EMPTY_PLAN: Plan = { steps: [], changes: [], peak: 0, createdAt: 0, updatedAt: 0 }
 
@@ -44,13 +44,29 @@ function scopeChange(before: Step[], after: Step[], at: number): ScopeChange | u
   return { at, from: before.length, to: after.length, added, removed }
 }
 
+/**
+ * Marks steps that this one update completed together. Models often tick off
+ * several steps at once, after the fact: those finish times are not when the
+ * work was done, so the estimator leaves them out of its timing.
+ */
+function markBatch(before: Step[], after: Step[]): Step[] {
+  const was = new Map(before.map(s => [s.content, s.status]))
+  const fresh = after.filter(s => s.status === 'completed' && was.get(s.content) !== 'completed')
+  if (fresh.length < 2) return after
+  const names = new Set(fresh.map(s => s.content))
+  return after.map(s => (names.has(s.content) ? { ...s, isBatch: true } : s))
+}
+
 /** Replaces the step list, carrying each surviving step's timing and reports. */
 function replace(plan: Plan, items: SubStep[], at: number): Plan {
   const old = new Map(plan.steps.map(s => [s.content, s]))
-  const steps = items.map(item => {
-    const kept: Step = old.get(item.content) ?? { content: item.content, status: 'pending' }
-    return moveTo(kept, item.status, at)
-  })
+  const steps = markBatch(
+    plan.steps,
+    items.map(item => {
+      const kept: Step = old.get(item.content) ?? { content: item.content, status: 'pending' }
+      return moveTo(kept, item.status, at)
+    }),
+  )
   const change = scopeChange(plan.steps, steps, at)
   return {
     steps,
@@ -85,7 +101,7 @@ export function applyUpdatePlan(plan: Plan, args: Record<string, unknown>, at: n
   if (typeof args.start === 'number' && steps[args.start - 1]) {
     steps = setStatus(steps, args.start - 1, 'in_progress', at)
   }
-  return steps === plan.steps ? plan : { ...plan, steps, updatedAt: at }
+  return steps === plan.steps ? plan : { ...plan, steps: markBatch(plan.steps, steps), updatedAt: at }
 }
 
 /** Claude Code's `TodoWrite`: always the whole list. */
@@ -102,7 +118,11 @@ export function applyWrapUp(plan: Plan, at: number): Plan {
 }
 
 /** What the model sends through `report_progress`. */
+export type Sizing = { step: string; size?: StepSize; minutes?: number }
+
 export type Report = {
+  /** Sizes for any steps of the plan, usually all of them, right after writing it. */
+  sizes?: Sizing[]
   step?: string
   subSteps?: SubStep[]
   percent?: number
@@ -115,7 +135,20 @@ export function toReport(args: Record<string, unknown>): Report {
   const num = (v: unknown, lo: number, hi: number) =>
     typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : undefined
   const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 400) : undefined)
+  const SIZES: readonly StepSize[] = ['S', 'M', 'L', 'XL']
+  const sizes = Array.isArray(args.sizes)
+    ? args.sizes
+        .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+        .map(x => ({
+          step: str(x.step) ?? '',
+          size: SIZES.includes(String(x.size).toUpperCase() as StepSize) ? (String(x.size).toUpperCase() as StepSize) : undefined,
+          minutes: num(x.minutes, 0.5, 24 * 60),
+        }))
+        .filter(x => x.step && (x.size || x.minutes !== undefined))
+        .slice(0, 40)
+    : undefined
   return {
+    sizes: sizes && sizes.length > 0 ? sizes : undefined,
     step: str(args.step),
     subSteps: toItems(args.subSteps)?.slice(0, 30),
     percent: num(args.percent, 0, 100),
@@ -129,13 +162,33 @@ export function toReport(args: Record<string, unknown>): Report {
  * Applies a report to the named step, or the one in progress. Returns the plan
  * unchanged with `matched: false` when there is no such step.
  */
-export function applyReport(plan: Plan, r: Report, at: number): { plan: Plan; matched: string | undefined } {
+function findStep(steps: Step[], name: string): number {
+  const lower = name.toLowerCase()
+  const exact = steps.findIndex(s => s.content.toLowerCase() === lower)
+  return exact >= 0 ? exact : steps.findIndex(s => s.content.toLowerCase().includes(lower) || lower.includes(s.content.toLowerCase()))
+}
+
+export function applyReport(plan: Plan, r: Report, at: number): { plan: Plan; matched: string | undefined; sized: number } {
+  let sized = 0
+  if (r.sizes) {
+    const steps = [...plan.steps]
+    for (const z of r.sizes) {
+      const i = findStep(steps, z.step)
+      const step = steps[i]
+      if (!step) continue
+      steps[i] = { ...step, size: z.size ?? step.size, estMinutes: z.minutes ?? step.estMinutes }
+      sized++
+    }
+    plan = { ...plan, steps, updatedAt: at }
+  }
+  const hasStepReport = r.step || r.subSteps || r.percent !== undefined || r.etaMinutes !== undefined || r.blocker !== undefined || r.note
+  if (!hasStepReport) return { plan, matched: undefined, sized }
   const lower = r.step?.toLowerCase()
   let index = lower ? plan.steps.findIndex(s => s.content.toLowerCase() === lower) : -1
   if (index < 0 && lower) index = plan.steps.findIndex(s => s.content.toLowerCase().includes(lower))
   if (index < 0) index = plan.steps.findIndex(s => s.status === 'in_progress')
   const step = plan.steps[index]
-  if (!step) return { plan, matched: undefined }
+  if (!step) return { plan, matched: undefined, sized }
   const next: Step = { ...step, reportedAt: at }
   if (r.subSteps) next.subSteps = r.subSteps
   if (r.percent !== undefined) next.percent = r.percent
@@ -143,7 +196,7 @@ export function applyReport(plan: Plan, r: Report, at: number): { plan: Plan; ma
   if (r.blocker !== undefined) next.blocker = r.blocker || undefined
   if (r.note !== undefined) next.note = r.note
   const steps = plan.steps.map((s, i) => (i === index ? next : s))
-  return { plan: { ...plan, steps, updatedAt: at }, matched: step.content }
+  return { plan: { ...plan, steps, updatedAt: at }, matched: step.content, sized }
 }
 
 export type Progress = { done: number; active: number; total: number; ratio: number }

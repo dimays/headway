@@ -9,7 +9,7 @@ scope moves. No more asking a session "where are we at?"
 THIS SESSION
 headway                                    3/7  52%
 ████████████████▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-● On track ⓘ                ~9–24 min left · rough ⓘ
+● On track            ~9–14 min left · calibrated ⓘ
 Plan grew from 5 to 7 steps · 1 change, last 4m ago ⓘ
 
 STEPS
@@ -66,13 +66,24 @@ The pane opens on its own in each new session. `/headway` reopens it;
   own ETA. Open a step (▸) for its parts, the subagents and background tasks
   working on it, and its order of operations: every tool call in sequence,
   with how long each took.
-- **ETAs that learn.** Estimates come from how long this session's finished
-  steps actually took, shown as a range (`~9–24 min`) marked *rough* until
-  three steps have finished. A step the session reports on uses its own
-  estimate.
-- **Measured vs. estimated.** The solid part of a bar is real progress:
-  finished steps, or what the session reported. The pale part is a guess
-  from elapsed time. Hover over a bar or any ⓘ for what it means.
+- **ETAs that say what they rest on.** Every estimate is labelled with its
+  basis: *measured* (this session's finished steps), *calibrated* (the
+  session's own step sizes, checked against how long finished steps really
+  took), *session's estimate* (minutes it reported for the step in
+  progress), *past sessions* (how long similar steps took before), or
+  *unchecked guess* (sizes nothing has checked yet). With nothing to go on,
+  it says **no estimate yet** instead of inventing a number.
+- **Working time only.** The clock runs while the session works, not while
+  it waits for your reply or a permission prompt, so a paused session's
+  estimate doesn't slip.
+- **Honest overruns.** A step past its estimate shows *over by 7m* (never a
+  fake "1 minute left"), the range widens, and when the projected finish
+  keeps moving the pane says how far (*finish moved +12m in the last 20m, 3
+  slips*) and offers **Ask for a new estimate**.
+- **Measured vs. inferred.** The solid part of a bar is real progress:
+  finished steps, or what the session reported. The pale part is inferred
+  from working time. Hover over a bar or any ⓘ for what it rests on;
+  tooltips are sized to the room above them, so they're never cut off.
 - **Health in plain words.** *On track*, *Slower than usual* (twice the
   typical step), *Quiet* (no tool call for 3 minutes), *Needs you* (a
   permission prompt or question is waiting), *Paused* (turn over, steps
@@ -111,9 +122,12 @@ each note is waiting, sent, or refused.
 Headway never asks the model for status. It watches what sessions already
 do: their task lists (`update_plan` in the desktop app, `TodoWrite` in the
 CLI), every tool call, subagent starts, and background tasks. It also gives
-the model one cheap tool, `report_progress`, for the parts of a step, a rough
-percent, minutes left and blockers, plus one line of system prompt asking it
-to report when that helps.
+the model one cheap tool, `report_progress`: right after writing its plan it
+sizes each step (S, M, L, XL or minutes), and as it works it can report a
+step's parts, a rough percent, minutes left and blockers. Steps checked off
+in a batch are left out of the timings, and finished steps' working times are
+kept by kind (tests, builds, research, …) to seed estimates in later
+sessions.
 
 Sessions share summaries through Headway's store (a JSON file under your
 Claude config directory). Nothing leaves your machine.

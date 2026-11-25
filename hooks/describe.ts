@@ -62,6 +62,8 @@ const FROM = 'The user sent this from the Headway progress pane'
 export function interventionText(kind: InterventionKind, label: string, note = ''): string {
   const about = label ? ` about “${label}”` : ''
   switch (kind) {
+    case 'estimate':
+      return `${FROM}: the estimate for “${label}” has slipped${note ? ` (${note})` : ''}. Call report_progress with a fresh etaMinutes for the step in progress and sizes for the steps left, based on what you now know, then carry on.`
     case 'context':
       return `${FROM}${about}:\n\n${note}`
     case 'status':
@@ -84,6 +86,7 @@ export function interventionText(kind: InterventionKind, label: string, note = '
 }
 
 export const INTERVENTION_LABEL: Record<InterventionKind, string> = {
+  estimate: 'New estimate',
   context: 'Note',
   status: 'Status check',
   wrap: 'Wrap up',

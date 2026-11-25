@@ -18,7 +18,17 @@ export type Step = {
   reportedAt?: number
   /** What the user asked for from the pane, shown as a badge until it lands. */
   priority?: 'next' | 'deferred' | 'skip'
+  /** The session's own sizing of the step, through report_progress. */
+  size?: StepSize
+  estMinutes?: number
+  /** Checked off together with other steps in one update: its timing is not real. */
+  isBatch?: boolean
 }
+
+export type StepSize = 'S' | 'M' | 'L' | 'XL'
+
+/** A span of time: a loop working (a turn), or waiting on the person. */
+export type Interval = { loop: string; start: number; end?: number }
 
 /** One moment the plan's scope moved: steps added or dropped by a rewrite. */
 export type ScopeChange = {
@@ -88,6 +98,7 @@ export type BgTask = {
 }
 
 export type InterventionKind =
+  | 'estimate'
   | 'context'
   | 'status'
   | 'wrap'
@@ -122,6 +133,12 @@ export type Board = {
   interventions: Intervention[]
   /** Whether the main loop is mid-turn, so a note can land at its next step. */
   turn: { running: boolean; startedAt?: number }
+  /** When each loop was working: the main loop's turns. Subagents work from start to end. */
+  work: Interval[]
+  /** When a loop was waiting on the person (a question, a permission prompt). */
+  waits: Interval[]
+  /** The projected finish time, sampled, to show when an estimate slips. */
+  etaLog: { at: number; finish: number }[]
 }
 
 /** What the pane shows open, kept apart from the data it draws. */
@@ -143,8 +160,8 @@ export type SessionSummary = {
   total: number
   active?: string
   health: Health
-  /** Minutes left, as a range. */
-  eta?: { low: number; high: number; isRough: boolean }
+  /** Minutes left, as a range, with what it rests on. */
+  eta?: { low: number; high: number; basis: string }
   agentsRunning: number
   tasksRunning: number
   steps: { content: string; status: StepStatus }[]
@@ -157,6 +174,8 @@ declare module 'claude-code' {
       board: Shaped<Board>
       others: SessionSummary[]
       view: View
+      /** Active minutes finished steps took, by kind of step, across sessions. */
+      history: Record<string, number[]>
     }
   }
 }

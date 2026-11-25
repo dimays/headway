@@ -101,10 +101,9 @@ test('a grown plan reads as a plain sentence, with the detail behind it', async 
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /Plan grew/ }))?.text).toMatch(/^Plan grew from 2 to 4 steps · 1 change, last just now/)
-  // The detail is a native tooltip on the ⓘ, so it takes no room in the pane.
+  // The detail floats above the line, holding what fits there, most important first.
   const tip = (await ui.find({ key: 'tip:scope' }))?.text
   expect(tip).toContain('added “C”, “D”')
-  expect(tip).toContain('adding steps moves the bar back')
   await ui.unmount()
 })
 
@@ -117,7 +116,7 @@ test('tooltips are instant floating cards on pointer surfaces, and absent on the
   // The hover area is the whole status line. Its card leaves the flow (so
   // nothing moves) and floats up over the rows above, which it paints over.
   const line = await desk.find({ key: 'tip:status' })
-  expect(line?.text).toContain('waiting on your reply')
+  expect(line?.text).toContain('No estimate yet')
   const card = JSON.stringify(line?.children)
   expect(card).toContain('"display":"none"')
   expect(card).toContain('"hover":{"display":"flex"}')
@@ -131,7 +130,7 @@ test('tooltips are instant floating cards on pointer surfaces, and absent on the
   // Every bar's tip is a card too: no native <title> anywhere.
   for (const svg of await desk.findAll({ type: 'Svg' })) expect(String(svg.props.source)).not.toContain('<title>')
   const step = JSON.stringify((await desk.find({ key: 'step:A' }))?.children)
-  expect(step).toContain('estimated from time')
+  expect(step).toContain('inferred from time')
   // Each step's bar has a line of its own under the name, in the same column:
   // no fixed widths to overflow, and nothing to overlap the text.
   for (const name of ['A', 'B']) {
@@ -177,7 +176,31 @@ test('TodoWrite plans count too', async ($, on) => {
   await ui.unmount()
 })
 
-test('ETAs come from how long finished steps took, and narrow as more finish', async ($, on) => {
+// ── Estimates ─────────────────────────────────────────────────────────
+
+/** Opens a turn: the main loop's clock only runs inside one. */
+function turns(on: On) {
+  let n = 0
+  on('turn.start', (_, e) => ({ turnId: `t${++n}`, text: e.text }))
+  on('turn.complete', () => ({ text: 'ok' }))
+  return {
+    start: ($: Dollar) => $.turn.start({ text: 'go', turnId: `t${n + 1}` }),
+    end: ($: Dollar) => $.turn.complete({ turnId: `t${n}`, answer: 'ok', durationMs: 0, isAborted: false } as Parameters<typeof $.turn.complete>[0]),
+  }
+}
+
+test('with nothing to go on, the pane says so instead of guessing', async ($, on) => {
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Research', 'Build', 'Ship') })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status' }))?.text).toContain('no estimate yet')
+  expect((await ui.find({ key: 'step:Build' }))?.text).toContain('no estimate')
+  await ui.unmount()
+})
+
+test('finished steps give a measured estimate, labelled as such', async ($, on) => {
   const { clock } = engine(on)
   await start($)
   await $.tool.call({ tool: PLAN, items: steps('A', 'B', 'C', 'D', 'E') })
@@ -187,13 +210,128 @@ test('ETAs come from how long finished steps took, and narrow as more finish', a
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // 2 steps left at ~2m each, not rough after 3 samples: ~3–5 min.
-  const status = await ui.find({ key: 'status' })
-  expect(status?.text).toMatch(/~3–5 min left/)
-  expect(status?.text).not.toContain('rough')
-  expect((await ui.find({ key: 'tip:status' }))?.text).toContain('2 steps at ~2m each, from 3 finished')
+  // Two steps left at a measured ~2m each, spread by how few steps it rests on.
+  const status = (await ui.find({ key: 'status' }))?.text
+  // No turn is running, so the time is work left, with the clock stopped.
+  expect(status).toMatch(/~3–6 min of work left · measured/)
   expect((await ui.find({ key: 'step:A' }))?.text).toContain('✓A2m')
+  expect((await ui.find({ key: 'step:E' }))?.text).toContain('~2m')
   await ui.unmount()
+})
+
+test("the session's sizes are a labelled guess until a finished step checks them", async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Write the parser', 'Write the tests', 'Ship') })
+  const reply = await $.tool.call({
+    tool: REPORT,
+    sizes: [
+      { step: 'Write the parser', size: 'L' },
+      { step: 'Write the tests', size: 'M' },
+      { step: 'Ship', minutes: 2 },
+    ],
+  })
+  expect(JSON.stringify(reply)).toContain('Sized 3 steps')
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status' }))?.text).toContain('unchecked guess')
+  expect((await ui.find({ key: 'step:Write the tests' }))?.text).toContain('~8m')
+  await ui.unmount()
+
+  // The parser (sized L, ~20m) took 10m: the session runs at half its sizes.
+  await clock.advance(10 * MIN)
+  await $.tool.call({ tool: PLAN, advance: true })
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'status' }))?.text).toContain('calibrated')
+  expect((await ui.find({ key: 'step:Ship' }))?.text).toContain('~1m')
+  await ui.unmount()
+})
+
+test('a step past its estimate says so, and offers to ask for a new one', async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Fix the bug', 'Ship') })
+  await $.tool.call({ tool: REPORT, sizes: [{ step: 'Fix the bug', size: 'S' }, { step: 'Ship', size: 'S' }] })
+  await clock.advance(10 * MIN)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const row = (await ui.find({ key: 'step:Fix the bug' }))?.text
+  expect(row).toContain('over by 7m')
+  expect(row).not.toMatch(/~\d+m left/)
+  await ui.press({ key: 'toggle:step:Fix the bug' })
+  expect(await ui.find({ key: 'step:Fix the bug:Ask for a new estimate' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('time waiting between turns is not counted as work', async ($, on) => {
+  const { clock } = engine(on)
+  const turn = turns(on)
+  await start($)
+  await turn.start($)
+  await $.tool.call({ tool: PLAN, items: steps('Build', 'Ship') })
+  await $.tool.call({ tool: REPORT, sizes: [{ step: 'Build', minutes: 10 }] })
+  await clock.advance(2 * MIN)
+  await turn.end($)
+  await clock.advance(60 * MIN) // the person is away for an hour
+  await turn.start($)
+  await clock.advance(1 * MIN)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // 3m of work against 10m sized, not 63m: ~7m left, not "over".
+  expect((await ui.find({ key: 'step:Build' }))?.text).toContain('~7m left')
+  await ui.unmount()
+})
+
+test('steps checked off together are not used as timings', async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('A', 'B', 'C') })
+  await clock.advance(6 * MIN)
+  await $.tool.call({ tool: PLAN, done: [1, 2], start: 3 })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:A' }))?.text).toContain('✓Adone')
+  expect((await ui.find({ key: 'status' }))?.text).toContain('no estimate yet')
+  await ui.unmount()
+})
+
+test('finished steps teach later sessions, by kind of step', async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Run the tests', 'Run the tests again', 'Run the tests once more', 'Run the final tests') })
+  for (let i = 0; i < 3; i++) {
+    await clock.advance(4 * MIN)
+    await $.tool.call({ tool: PLAN, advance: true })
+  }
+  // A new plan, with nothing finished in it yet: its test step takes its
+  // estimate from how long test steps took before, and says so.
+  await $.tool.call({ tool: PLAN, items: steps('Run the smoke tests', 'Ship') })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Run the smoke tests' }))?.text).toContain('~4m left')
+  expect((await ui.find({ key: 'status' }))?.text).toContain('past sessions')
+  await ui.unmount()
+})
+
+test('tooltips fit the room above them, and drop out rather than be cut off', async ($, on) => {
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('A', 'B', 'C', 'D', 'E', 'F') })
+
+  // At the top of the pane the status line has a row or two above it: its
+  // card keeps only what fits there, most important first.
+  const top = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns: 50 } })
+  const tipText = (await top.find({ key: 'tip:status' }))?.text ?? ''
+  const status = (await top.find({ key: 'status' }))?.text ?? ''
+  const card = tipText.slice(status.length)
+  expect(card.length).toBeGreaterThan(0)
+  expect(card.length).toBeLessThanOrEqual(44)
+  // Scrolled so the header sits at the window's top edge: no room, no card.
+  await top.unmount()
+  const scrolled = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, scroll: { offset: 3, bodyRows: 40 } } })
+  expect(await scrolled.find({ key: 'tip:status' })).toBeUndefined()
+  // A step far down has room for its whole card.
+  expect((await scrolled.find({ key: 'tip:bar:step:F' }))?.text).toContain("isn't counted in the time left")
+  await scrolled.unmount()
 })
 
 test('a subagent shows under its step once the step is opened', async ($, on) => {
@@ -254,7 +392,7 @@ test('a step that is going fine offers only Add context; a quiet one offers a st
   await clock.advance(4 * 60_000)
   await ui.unmount()
   const later = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await later.find({ key: 'step:Build' }))?.text).toContain('Quiet for 4m')
+  expect((await later.find({ key: 'step:Build' }))?.text).toContain('Quiet: no tool call for 3+ minutes')
   await later.press({ key: 'step:Build:Status check' })
   const ran = await $.tool.call({ tool: 'Read', file_path: '/work/demo/a.md' })
   expect(JSON.stringify(ran)).toContain('give a short status update on “Build”')
@@ -277,7 +415,7 @@ test('a question waiting on the person reads Needs you', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ key: 'status' }))?.text).toContain('Needs you')
-  expect((await ui.find({ key: 'step:Decide' }))?.text).toContain('Waiting on you in the chat')
+  expect((await ui.find({ key: 'step:Decide' }))?.text).toContain('Needs you: a permission prompt or question')
   await ui.unmount()
   await clock.advance(30_000)
   await asking
@@ -338,6 +476,25 @@ test('a background command is tracked outside the plan, and can be stopped', asy
   await ui.press({ key: 'task:bg-1:Stop' })
   expect(stopped).toEqual(['bg-1'])
   expect((await ui.find({ key: 'task:bg-1' }))?.text).toContain('stopped')
+  await ui.unmount()
+})
+
+test('a board saved before the newer fields existed still draws', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  on('session.root', () => ({ value: '/work/demo' }))
+  // board-2 as v0.2 saved it: no work, waits or etaLog.
+  const old = {
+    plans: { main: { steps: [{ content: 'Build', status: 'in_progress', startedAt: 900_000 }], changes: [], peak: 1, createdAt: 900_000, updatedAt: 900_000 } },
+    agents: [],
+    activity: [],
+    tasks: [],
+    interventions: [],
+    turn: { running: true, startedAt: 900_000 },
+  }
+  on('state.get', (_, e) => ({ value: { value: (e as { key: string }).key === 'board' ? { shape: 'board-2', value: old } : undefined, version: 1 } }))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Build' }))?.text).toContain('Build')
   await ui.unmount()
 })
 

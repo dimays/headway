@@ -28,19 +28,24 @@ import {
 import {
   HEALTH,
   ago,
+  basisWords,
+  calibrate,
   duration,
-  expectedStep,
+  estimateStep,
   health,
-  isWaitingOnYou,
+  isSample,
+  isWaiting,
+  kindOf,
   lastActivity,
+  logEta,
   planEta,
   planFraction,
   range,
-  stepFraction,
-  stepRemainingMs,
+  slips,
+  stepActiveMs,
   worst,
 } from './eta'
-import type { Eta } from './eta'
+import type { Context, Eta } from './eta'
 import { barSvg, barText, percent } from './bar'
 import type { BarSpec } from './bar'
 import { INTERVENTION_LABEL, describeCall, describeScope, interventionText } from './describe'
@@ -68,16 +73,19 @@ const SHAPE = 'board-2'
 const BOARD = { plugin: 'headway', key: 'board' } as const
 const OTHERS = { plugin: 'headway', key: 'others' } as const
 const VIEW = { plugin: 'headway', key: 'view' } as const
-const EMPTY_BOARD: Board = { plans: {}, agents: [], activity: [], tasks: [], interventions: [], turn: { running: false } }
+const HISTORY = { plugin: 'headway', key: 'history' } as const
+const EMPTY_BOARD: Board = { plans: {}, agents: [], activity: [], tasks: [], interventions: [], turn: { running: false }, work: [], waits: [], etaLog: [] }
 const EMPTY_VIEW: View = { open: [] }
 // What the pane reads while drawing: atoms subscribe the pane to each write.
 const boardAtom = atom(BOARD, EMPTY_BOARD, { shape: SHAPE })
 const othersAtom = atom(OTHERS, [])
 const viewAtom = atom(VIEW, EMPTY_VIEW)
+const historyAtom = atom(HISTORY, {})
 
 const PROMPT_SECTION = [
   'Headway, a progress pane beside this chat, shows the user your plan, each step and how long it is taking.',
-  'When a step has distinct parts, when you finish a meaningful part, when you can estimate the time left, or when you are blocked, call the report_progress tool (mcp__headway__report_progress) with the step, its sub-steps and their status, a rough percent and minutes left.',
+  'Right after you write or change your plan, call the report_progress tool (mcp__headway__report_progress) once with `sizes`: each step with a size (S, M, L or XL) or rough minutes, so the pane can estimate time left. Headway checks your sizes against how long finished steps really take.',
+  'When a step has distinct parts, when you finish a meaningful part, when you can estimate the time left, or when you are blocked, call report_progress with the step, its sub-steps and their status, a rough percent and minutes left.',
   'Keep reports short and skip them for trivial steps.',
   'Text that begins "The user sent this from the Headway progress pane" is the user\'s own instruction, sent while you work: act on it.',
 ].join(' ')
@@ -85,6 +93,19 @@ const PROMPT_SECTION = [
 const REPORT_SCHEMA = {
   type: 'object',
   properties: {
+    sizes: {
+      type: 'array',
+      description: "Sizes for the plan's steps, usually all of them, right after writing the plan: S (a few minutes), M (~10), L (~20), XL (45+), or rough minutes.",
+      items: {
+        type: 'object',
+        properties: {
+          step: { type: 'string', description: 'The step, as written in the plan.' },
+          size: { type: 'string', enum: ['S', 'M', 'L', 'XL'] },
+          minutes: { type: 'number' },
+        },
+        required: ['step'],
+      },
+    },
     step: { type: 'string', description: 'The plan step this is about, as written in the plan. Defaults to the step in progress.' },
     subSteps: {
       type: 'array',
@@ -273,7 +294,9 @@ async function syncSessions($: EngineInterface, id: string) {
   const p = progress(main)
   if (p.total > 0) {
     const root = await $.session.root()
-    const eta = planEta(main, now)
+    const { value: history } = await $.state.get(HISTORY)
+    const eta = sessionEta(b, now, history ?? {})
+    const model = calibrate(main, contextOf(b, MAIN, now, history ?? {}))
     const mine: SessionSummary = {
       id,
       name: basename(root),
@@ -281,8 +304,8 @@ async function syncSessions($: EngineInterface, id: string) {
       done: p.done,
       total: p.total,
       active: activeStep(main),
-      health: sessionHealth(b, now),
-      eta: eta && { low: eta.low, high: eta.high, isRough: eta.isRough },
+      health: sessionHealth(b, now, history ?? {}),
+      eta: eta && eta.basis !== 'none' ? { low: eta.low, high: eta.high, basis: basisWords(eta.basis, model) } : undefined,
       agentsRunning: b.agents.filter(a => !ENDED.has(a.status) && a.status !== 'idle').length,
       tasksRunning: b.tasks.filter(t => t.status === 'running').length,
       steps: (main?.steps ?? []).slice(0, 20).map(s => ({ content: s.content, status: s.status })),
@@ -323,23 +346,28 @@ let sessionId = ''
 
 // ── Health ───────────────────────────────────────────────────────────────
 
-function loopHealth(b: Board, loop: string, now: number): Health {
+/** How a loop's time is counted: the main loop in its turns, a subagent throughout. */
+function contextOf(b: Board, loop: string, now: number, history: Record<string, number[]>): Context {
+  return { now, loop, isAgent: loop !== MAIN, work: b.work, waits: b.waits, history }
+}
+
+function loopHealth(b: Board, loop: string, now: number, history: Record<string, number[]> = {}): Health {
   const plan = b.plans[loop]
   const steps = plan?.steps ?? []
   if (loop === MAIN && steps.length > 0 && steps.every(s => s.status === 'completed')) return 'done'
   const agent = b.agents.find(a => a.id === loop)
   if (agent?.status === 'failed') return 'failed'
   if (agent && ENDED.has(agent.status)) return 'done'
+  const ctx = contextOf(b, loop, now, history)
   const current = steps.find(s => s.status === 'in_progress')
-  const exp = expectedStep(plan)
+  const est = current ? estimateStep(current, calibrate(plan, ctx), ctx) : undefined
   return health({
     now,
     isRunning: loop === MAIN ? b.turn.running : agent?.status === 'running',
-    startedAt: current?.startedAt ?? agent?.startedAt,
-    expectedMs: exp.ms,
-    samples: exp.samples,
+    isWaiting: isWaiting(ctx) || b.activity.some(x => x.loop === loop && x.needsYou && x.endedAt === undefined),
+    activeMs: est?.activeMs ?? 0,
+    expectedMs: est?.expectedMs,
     lastActivityAt: lastActivity(b.activity, loop) ?? agent?.startedAt ?? b.turn.startedAt,
-    needsYou: isWaitingOnYou(b.activity, loop),
   })
 }
 
@@ -350,9 +378,52 @@ function taskHealth(t: BgTask, now: number): Health {
   return t.kind === 'shell' && now - last > TASK_QUIET_MS ? 'quiet' : 'on-track'
 }
 
-function sessionHealth(b: Board, now: number): Health {
+function sessionHealth(b: Board, now: number, history: Record<string, number[]> = {}): Health {
   const loops = [MAIN, ...b.agents.filter(a => !ENDED.has(a.status)).map(a => a.id)]
-  return worst([...loops.map(l => loopHealth(b, l, now)), ...b.tasks.filter(t => t.status === 'running').map(t => taskHealth(t, now))])
+  return worst([...loops.map(l => loopHealth(b, l, now, history)), ...b.tasks.filter(t => t.status === 'running').map(t => taskHealth(t, now))])
+}
+
+/**
+ * Time the session's subagents still need, in ms: a running subagent with a
+ * plan of its own counts its own estimate. The main plan cannot finish before
+ * the subagents working on it.
+ */
+function agentsExtraMs(b: Board, now: number, history: Record<string, number[]>): number {
+  let extra = 0
+  for (const a of b.agents) {
+    if (ENDED.has(a.status) || a.parentId) continue
+    const eta = planEta(b.plans[a.id], contextOf(b, a.id, now, history))
+    if (eta && eta.basis !== 'none') extra = Math.max(extra, eta.mid * 60_000)
+  }
+  return extra
+}
+
+/** The main plan's estimate, subagents included. */
+function sessionEta(b: Board, now: number, history: Record<string, number[]>): Eta | undefined {
+  return planEta(b.plans[MAIN], contextOf(b, MAIN, now, history), agentsExtraMs(b, now, history))
+}
+
+/** Samples the projected finish so the pane can say when an estimate slips. */
+async function sampleEta($: EngineInterface) {
+  const now = await $.clock.now()
+  const { value: history } = await $.state.get(HISTORY)
+  await changeBoard($, b => {
+    if (!b.turn.running) return b
+    const eta = sessionEta(b, now, history ?? {})
+    const finish = eta && eta.basis !== 'none' ? now + eta.mid * 60_000 : undefined
+    const log = logEta(b.etaLog, now, finish)
+    return log === b.etaLog ? b : { ...b, etaLog: log }
+  })
+}
+
+/** Remembers how long finished steps took, by kind, for later sessions' first guesses. */
+async function learn($: EngineInterface, minutes: { kind: string; minutes: number }[]) {
+  if (minutes.length === 0) return
+  const stored = ((await $.store.get('history')) as Record<string, number[]> | undefined) ?? {}
+  const next: Record<string, number[]> = { ...stored }
+  for (const m of minutes) next[m.kind] = [...(next[m.kind] ?? []), Math.round(m.minutes * 10) / 10].slice(-40)
+  await $.store.set('history', next)
+  await $.state.set(HISTORY, next)
 }
 
 // ── Interventions ────────────────────────────────────────────────────────
@@ -502,11 +573,14 @@ export const register: Register = on => {
       isDeferred: false,
     })
     void $.ui.open({ id: PANE, title: TITLE })
+    const stored = (await $.store.get('history')) as Record<string, number[]> | undefined
+    if (stored && typeof stored === 'object') await $.state.set(HISTORY, stored)
 
     $.clock.every(3000, () => {
       void refreshAgents($)
       void refreshTasks($)
       void deliverPending($)
+      void sampleEta($)
     })
     $.clock.every(5000, () => void syncSessions($, sessionId))
 
@@ -521,7 +595,11 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
       const now = await $.clock.now()
-      await changeBoard($, b => ({ ...b, turn: { running: true, startedAt: now } }))
+      await changeBoard($, b => ({
+        ...b,
+        turn: { running: true, startedAt: now },
+        work: [...b.work.map(w => (w.loop === MAIN && w.end === undefined ? { ...w, end: now } : w)), { loop: MAIN, start: now }].slice(-300),
+      }))
     }
     return next(e)
   })
@@ -529,7 +607,14 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (!e.agentId) {
-      await changeBoard($, b => ({ ...b, turn: { running: false, startedAt: b.turn.startedAt } }))
+      const now = await $.clock.now()
+      await changeBoard($, b => ({
+        ...b,
+        turn: { running: false, startedAt: b.turn.startedAt },
+        work: b.work.map(w => (w.loop === MAIN && w.end === undefined ? { ...w, end: now } : w)),
+        // A turn's end closes any wait the loop had open.
+        waits: b.waits.map(w => (w.loop === MAIN && w.end === undefined ? { ...w, end: now } : w)),
+      }))
       await deliverPending($)
     }
     return done
@@ -561,7 +646,11 @@ export const register: Register = on => {
       startedAt,
       needsYou: e.tool === 'AskUserQuestion' ? true : undefined,
     }
-    await changeBoard($, b => ({ ...b, activity: [...b.activity, act].slice(-400) }))
+    await changeBoard($, b => ({
+      ...b,
+      activity: [...b.activity, act].slice(-400),
+      waits: act.needsYou ? [...b.waits, { loop, start: startedAt }].slice(-200) : b.waits,
+    }))
 
     const ran = await next(e)
     const at = await $.clock.now()
@@ -569,13 +658,22 @@ export const register: Register = on => {
     await changeBoard($, b => ({
       ...b,
       activity: b.activity.map(a => (a.id === act.id ? { ...a, endedAt: at, isError: failed || undefined, needsYou: undefined } : a)),
+      waits: b.waits.map(w => (w.loop === loop && w.end === undefined ? { ...w, end: at } : w)),
     }))
     if (ran.deny) return ran
 
     if (!ran.isError) {
+      const plansBefore = (await getBoard($)).plans[loop]
       if (e.tool === UPDATE_PLAN) await setPlan($, loop, p => applyUpdatePlan(p, args, at))
       else if (e.tool === 'TodoWrite') await setPlan($, loop, p => applyTodoWrite(p, args, at))
       else if (e.tool === WRAP_UP) await setPlan($, loop, p => applyWrapUp(p, at))
+      if (e.tool === UPDATE_PLAN || e.tool === 'TodoWrite' || e.tool === WRAP_UP) {
+        const board = await getBoard($)
+        const was = new Map((plansBefore?.steps ?? []).map(x => [x.content, x.status]))
+        const ctx = contextOf(board, loop, at, {})
+        const finished = (board.plans[loop]?.steps ?? []).filter(x => was.get(x.content) !== 'completed' && isSample(x, ctx))
+        await learn($, finished.map(x => ({ kind: kindOf(x.content), minutes: stepActiveMs(x, ctx) / 60_000 })))
+      }
       await trackTask($, e.tool, args, ran.result as Record<string, unknown> | undefined, loop, at)
     }
 
@@ -597,27 +695,33 @@ export const register: Register = on => {
     const at = await $.clock.now()
     const report = toReport(e as unknown as Record<string, unknown>)
     let matched: string | undefined
+    let sized = 0
     await setPlan($, loop, p => {
       const applied = applyReport(p, report, at)
       matched = applied.matched
+      sized = applied.sized
       return applied.plan
     })
+    const said = [sized > 0 && `Sized ${sized} step${sized === 1 ? '' : 's'}.`, matched && `Recorded on “${matched}”.`].filter(Boolean)
     return {
-      result: matched
-        ? `Recorded on “${matched}”. The user sees it in the Headway pane.`
-        : 'No matching step: write your plan first (update_plan or TodoWrite), then report on a step of it.',
+      result:
+        said.length > 0
+          ? `${said.join(' ')} The user sees it in the Headway pane.`
+          : 'No matching step: write your plan first (update_plan or TodoWrite), then report on a step of it.',
     }
   })
 
   on('classic.PermissionRequest', async ($, e, next) => {
     const loop = (e as unknown as { agent_id?: string }).agent_id ?? MAIN
+    const now = await $.clock.now()
     await changeBoard($, b => {
       const open = [...b.activity].reverse().find(a => a.loop === loop && a.endedAt === undefined)
-      if (!open) return b
-      return { ...b, activity: b.activity.map(a => (a.id === open.id ? { ...a, needsYou: true } : a)) }
+      const waits = b.waits.some(w => w.loop === loop && w.end === undefined) ? b.waits : [...b.waits, { loop, start: now }].slice(-200)
+      if (!open) return { ...b, waits }
+      return { ...b, waits, activity: b.activity.map(a => (a.id === open.id ? { ...a, needsYou: true } : a)) }
     })
     return next(e)
-  })
+  }).catch(($, e, next) => next(e)) // never block the prompt over a headway bug
 
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
@@ -633,7 +737,7 @@ export const register: Register = on => {
       })
     }
     return result
-  })
+  }).catch(($, e, next) => next(e)) // never hold the turn's end over a headway bug
 
   // Subagents, nested under the step their parent was on when it spawned them.
   on('agent.spawn', async ($, e, next) => {
@@ -663,49 +767,93 @@ export const register: Register = on => {
     // The terminal is the one surface without SVG; it gets lines of rules and no ⓘ.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
     const Input = 'Input' in table ? table.Input : undefined
-    const b = await read($, boardAtom)
+    // A board saved by an earlier version lacks the newer fields: fill them in.
+    const b: Board = { ...EMPTY_BOARD, ...(await read($, boardAtom)) }
     const storedOthers = await read($, othersAtom)
     const others = Array.isArray(storedOthers) ? storedOthers : []
     const storedView = await read($, viewAtom)
     const view: View = storedView && Array.isArray(storedView.open) ? storedView : EMPTY_VIEW
+    const storedHistory = await read($, historyAtom)
+    const history: Record<string, number[]> = storedHistory && typeof storedHistory === 'object' ? storedHistory : {}
     const now = await $.clock.now()
     const here = basename(await $.session.root())
     const columns = Math.max(24, e.props.bodyColumns ?? 40)
+    const scrollTop = e.props.scroll?.offset ?? 0
     const isOpen = (key: string) => view.open.includes(key)
+
+    // ── Where things sit ────────────────────────────────────────────────
+    // A tooltip floats above its line, so it has only the rows between that
+    // line and the top of the visible pane. The pane is drawn top to bottom
+    // in the order this hook builds it, so `y` counts rows as they are built.
+    // It counts low on purpose (each line as 0.8 of a row, gaps as nothing):
+    // a card sized to fit an undercount always fits the real room.
+    let y = 0
+    const advance = (rows: number) => {
+      y += rows
+    }
+    const LINE = 0.8
+    const CARD_LINE = 0.85
+    const CARD_FRAME = 1.3
+    const perLine = Math.max(16, columns - 6)
+    const linesOf = (text: string) => Math.max(1, Math.ceil(text.length / perLine))
+    /**
+     * The sentences that fit in the room above a line, most important first,
+     * or none: a card is shown whole or not at all, never cut off by the pane.
+     */
+    const fit = (sentences: string[], at: number): string | undefined => {
+      const room = at - scrollTop
+      const maxLines = Math.floor((room - CARD_FRAME) / CARD_LINE)
+      if (maxLines < 1) return undefined
+      const kept: string[] = []
+      for (const sentence of sentences.filter(Boolean)) {
+        const next = [...kept, sentence].join(' ')
+        if (linesOf(next) > maxLines) break
+        kept.push(sentence)
+      }
+      if (kept.length > 0) return kept.join(' ')
+      const first = sentences.find(Boolean)
+      return first ? `${first.slice(0, maxLines * perLine - 1).trimEnd()}…` : undefined
+    }
 
     // ── Primitives ──────────────────────────────────────────────────────
 
-    const sectionLabel = (text: string, aside?: string) => (
-      <Box flexDirection="row" justifyContent="space-between">
-        <Text size="caption" weight="semibold" dimColor>
-          {text.toUpperCase()}
-        </Text>
-        {aside && (
-          <Text size="caption" dimColor>
-            {aside}
+    const sectionLabel = (text: string, aside?: string) => {
+      advance(LINE)
+      return (
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text size="caption" weight="semibold" dimColor>
+            {text.toUpperCase()}
           </Text>
-        )}
-      </Box>
-    )
+          {aside && (
+            <Text size="caption" dimColor>
+              {aside}
+            </Text>
+          )}
+        </Box>
+      )
+    }
 
-    const caption = (text: string, color?: string) => (
-      <Text size="caption" dimColor={!color} color={color} wrap="truncate-end">
-        {text}
-      </Text>
-    )
+    const caption = (text: string, color?: string) => {
+      advance(LINE)
+      return (
+        <Text size="caption" dimColor={!color} color={color} wrap="truncate-end">
+          {text}
+        </Text>
+      )
+    }
 
     // Tooltips. The trigger and its card sit in a keyed Box: a keyed Box is a
-    // hover scope, so the card shows the instant the pointer is over it, with
-    // no browser delay. The card is absolute, so it leaves the flow and showing
-    // it moves nothing. The engine places it against its parent (the keyed Box,
-    // as wide as the trigger's line) and paints it over what comes before it,
-    // while what comes after paints over it, so every card floats upward
-    // (bottom: 1 puts its lower edge at the top of the line) over the rows
-    // above. Its background is opaque. The terminal has no pointer, so it gets
-    // the trigger alone.
+    // hover scope, so the card shows the instant the pointer is over it. The
+    // card is absolute, so it leaves the flow and showing it moves nothing.
+    // The engine places it against its parent (the keyed Box, as wide as the
+    // trigger's line) and paints it over what comes before it, so it floats
+    // upward (bottom: 1) over the rows above, opaque, sized by `fit` to the
+    // room it has. The terminal has no pointer, so it gets the trigger alone.
     const pointer = e.surface !== 'terminal'
-    const tip = (key: string, trigger: ReturnType<typeof h>, text: string | undefined) =>
-      pointer && text ? (
+    const tip = (key: string, trigger: ReturnType<typeof h>, sentences: string[], at: number) => {
+      const text = pointer ? fit(sentences, at) : undefined
+      if (!text) return trigger
+      return (
         <Box key={`tip:${key}`} flexDirection="column">
           {trigger}
           <Box
@@ -727,32 +875,15 @@ export const register: Register = on => {
             </Text>
           </Box>
         </Box>
-      ) : (
-        trigger
       )
-    /**
-     * A cue that the line it sits on explains itself on hover. The hover area
-     * is the whole line (see `tip` around the status and scope lines), so the
-     * card is as wide as the line, never as wide as this one glyph.
-     */
+    }
+    /** A cue that the line it sits on explains itself on hover. */
     const infoIcon = () =>
       pointer ? (
         <Text size="caption" color="suggestion">
           ⓘ
         </Text>
       ) : null
-
-    const bar = (spec: BarSpec, height: number) => {
-      if (Svg) return <Svg source={barSvg(spec, height)} alt={`${Math.round(spec.done * 100)}% done`} height={height} />
-      const t = barText(spec, columns - 2)
-      return textBar(spec, t)
-    }
-
-    /** A row's thin bar, the width of the row's text column. */
-    const rowBar = (spec: BarSpec) => {
-      if (Svg) return <Svg source={barSvg(spec, 4)} alt={`${Math.round((spec.done + spec.estimate) * 100)}%`} height={4} />
-      return textBar(spec, barText(spec, Math.max(8, columns - 8)))
-    }
 
     const textBar = (spec: BarSpec, t: { done: string; estimate: string; rest: string }) => {
       const color = spec.isComplete ? 'success' : spec.tone === 'error' ? 'error' : spec.tone === 'warning' ? 'warning' : 'claude'
@@ -766,6 +897,16 @@ export const register: Register = on => {
         </Text>
       )
     }
+    const bar = (spec: BarSpec, height: number) => {
+      advance(LINE)
+      if (Svg) return <Svg source={barSvg(spec, height)} alt={`${Math.round(spec.done * 100)}% done`} height={height} />
+      return textBar(spec, barText(spec, columns - 2))
+    }
+    const rowBar = (spec: BarSpec) => {
+      advance(LINE * 0.6)
+      if (Svg) return <Svg source={barSvg(spec, 4)} alt={`${Math.round((spec.done + spec.estimate) * 100)}%`} height={4} />
+      return textBar(spec, barText(spec, Math.max(8, columns - 8)))
+    }
 
     const toneOf = (hl: Health): BarSpec['tone'] =>
       hl === 'failed' || hl === 'needs-you' ? 'error' : hl === 'slow' || hl === 'quiet' ? 'warning' : 'normal'
@@ -775,38 +916,32 @@ export const register: Register = on => {
         <Text size="footnote" color={HEALTH[hl].color} weight="medium">
           ● {HEALTH[hl].label}
         </Text>
-        {infoIcon()}
       </Box>
     )
 
     type Action = { label: string; run: () => void; primary?: boolean }
     /** At most two, and only the ones that make sense for the row's state. */
-    const actions = (key: string, list: Action[]) =>
-      list.length === 0 ? null : (
+    const actions = (key: string, list: Action[]) => {
+      if (list.length === 0) return null
+      advance(1.2)
+      return (
         <Box flexDirection="row" gap="xs">
           {list.slice(0, 2).map(a => (
             <Button key={`${key}:${a.label}`} label={a.label} variant={a.primary ? 'primary' : 'secondary'} onPress={() => a.run()} />
           ))}
         </Box>
       )
+    }
 
-    const composer = (key: string, target: Target, placeholder: string) =>
-      view.composing === key && Input ? (
-        <Input key={`note:${key}`} placeholder={placeholder} submitLabel="Send" rows={2} autoFocus onSubmit={value => void sendNote($, target, key, value)} />
-      ) : null
+    const composer = (key: string, target: Target, placeholder: string) => {
+      if (view.composing !== key || !Input) return null
+      advance(2)
+      return <Input key={`note:${key}`} placeholder={placeholder} submitLabel="Send" rows={2} autoFocus onSubmit={value => void sendNote($, target, key, value)} />
+    }
 
     const toggleButton = (key: string) => (
       <Button key={`toggle:${key}`} plain label={isOpen(key) ? '▾' : '▸'} onPress={() => void toggle($, key)} />
     )
-
-    /** What a row's state means in a few words, when it is not simply fine. */
-    const problem = (hl: Health, startedAt: number | undefined, lastAt: number | undefined, typicalMs: number): string | undefined => {
-      if (hl === 'needs-you') return 'Waiting on you in the chat'
-      if (hl === 'quiet') return `Quiet for ${duration(now - (lastAt ?? startedAt ?? now))}`
-      if (hl === 'slow') return `Running ${duration(now - (startedAt ?? now))}, usually ~${duration(typicalMs)}`
-      if (hl === 'failed') return 'Failed'
-      return undefined
-    }
 
     const timeline = (items: Activity[], since?: number) => {
       if (items.length === 0) return caption('No tool calls yet.')
@@ -815,6 +950,7 @@ export const register: Register = on => {
         <Box flexDirection="column">
           {items.length > shown.length && caption(`${items.length - shown.length} earlier calls`)}
           {shown.map(a => {
+            advance(LINE)
             const offset = since !== undefined ? `+${duration(a.startedAt - since)}` : ago(now - a.startedAt)
             const took = a.endedAt !== undefined ? duration(a.endedAt - a.startedAt) : '…'
             const color = a.isError || a.needsYou ? 'error' : a.endedAt === undefined ? 'claude' : undefined
@@ -842,37 +978,69 @@ export const register: Register = on => {
     /**
      * A row: toggle and status mark, then one column holding the name (with
      * its tag and time on the same line) and, under it, the bar. Every bar
-     * starts where the names start and runs to the right edge, so the bars line
-     * up without fixed widths, and text and bar never share a line.
+     * starts where the names start and runs to the right edge.
      */
-    const rowLine = (key: string, mark: string, markColor: string, name: string, opts: { strong?: boolean; faded?: boolean; tag?: string; mini?: BarSpec; miniTip?: string; right?: string }) => (
-      <Box flexDirection="row" gap="sm">
-        {toggleButton(key)}
-        <Text mono color={markColor}>
-          {mark}
-        </Text>
-        <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
-          <Box flexDirection="row" gap="sm" alignItems="center">
-            <Box flexGrow={1} flexShrink={1} minWidth={0}>
-              <Text weight={opts.strong ? 'semibold' : 'regular'} dimColor={opts.faded} wrap="truncate-end">
-                {name}
-              </Text>
+    const rowLine = (
+      key: string,
+      mark: string,
+      markColor: string,
+      name: string,
+      opts: { strong?: boolean; faded?: boolean; tag?: string; mini?: BarSpec; miniTip?: string[]; right?: string },
+    ) => {
+      advance(LINE)
+      const barAt = y
+      const barLine = opts.mini ? tip(`bar:${key}`, rowBar(opts.mini), opts.miniTip ?? [], barAt) : null
+      return (
+        <Box flexDirection="row" gap="sm">
+          {toggleButton(key)}
+          <Text mono color={markColor}>
+            {mark}
+          </Text>
+          <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
+            <Box flexDirection="row" gap="sm" alignItems="center">
+              <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                <Text weight={opts.strong ? 'semibold' : 'regular'} dimColor={opts.faded} wrap="truncate-end">
+                  {name}
+                </Text>
+              </Box>
+              {opts.tag && (
+                <Text size="caption" color="suggestion" weight="medium">
+                  {opts.tag}
+                </Text>
+              )}
+              {opts.right && (
+                <Text size="caption" mono dimColor>
+                  {opts.right}
+                </Text>
+              )}
             </Box>
-            {opts.tag && (
-              <Text size="caption" color="suggestion" weight="medium">
-                {opts.tag}
-              </Text>
-            )}
-            {opts.right && (
-              <Text size="caption" mono dimColor>
-                {opts.right}
-              </Text>
-            )}
+            {barLine}
           </Box>
-          {opts.mini && tip(`bar:${key}`, rowBar(opts.mini), opts.miniTip)}
         </Box>
-      </Box>
-    )
+      )
+    }
+
+    // ── The numbers ─────────────────────────────────────────────────────
+
+    const main = b.plans[MAIN]
+    const steps = main?.steps ?? []
+    const ctx = contextOf(b, MAIN, now, history)
+    const model = calibrate(main, ctx)
+    const mainH = loopHealth(b, MAIN, now, history)
+    const eta = sessionEta(b, now, history)
+    const slip = slips(b.etaLog, now)
+    const isSlipping = slip.count >= 2 || slip.movedMs > 10 * 60_000
+    const current = steps.find(s => s.status === 'in_progress')
+    const currentEst = current ? estimateStep(current, model, ctx) : undefined
+    const isPaused = steps.some(s => s.status !== 'completed') && !b.turn.running
+
+    const BASIS_TAG: Record<string, string> = {
+      reported: "session's estimate",
+      calibrated: 'calibrated',
+      measured: 'measured',
+      history: 'past sessions',
+      sized: 'unchecked guess',
+    }
 
     // ── Rows ────────────────────────────────────────────────────────────
 
@@ -884,26 +1052,31 @@ export const register: Register = on => {
       const color = task.status === 'failed' ? 'error' : running ? (hl === 'quiet' ? 'warning' : 'claude') : 'subtle'
       const elapsed = (task.endedAt ?? now) - task.startedAt
       const target: Target = { kind: 'task', task }
-      const right = running ? duration(elapsed) : `${task.status} · ${duration(elapsed)}`
+      const left = task.kind === 'monitor' && task.timeoutMs && running ? `ends by ${duration(task.timeoutMs - elapsed)}` : undefined
+      const right = running ? left ?? duration(elapsed) : `${task.status} · ${duration(elapsed)}`
       const quiet = running && hl === 'quiet' ? `No output for ${duration(now - (task.lastOutputAt ?? task.startedAt))}` : undefined
+      const head = rowLine(key, mark, color, task.description, { faded: !running, right })
+      const under = quiet ? caption(quiet, 'warning') : running && task.lastLine ? caption(task.lastLine) : null
+      const body = isOpen(key) ? (
+        <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+          {caption(`${task.kind} · started ${ago(now - task.startedAt)}${task.step ? ` during “${task.step}”` : ''}${task.bytes !== undefined ? ` · ${Math.round(task.bytes / 1024)} KB output` : ''}`)}
+          {caption(task.kind === 'shell' ? 'A shell command has no estimate: it runs until it exits.' : task.kind === 'monitor' ? 'A monitor ends at its deadline at the latest.' : 'A workflow reports when it finishes.')}
+          {!running && task.lastLine && caption(`Last output: ${task.lastLine}`)}
+          {actions(
+            key,
+            running
+              ? [{ label: 'Stop', run: () => void intervene($, 'stop', target), primary: hl === 'quiet' }]
+              : task.status === 'failed' || task.status === 'stopped'
+                ? [{ label: 'Retry', run: () => void intervene($, 'retry', target) }]
+                : [],
+          )}
+        </Box>
+      ) : null
       return (
         <Box key={key} flexDirection="column">
-          {rowLine(key, mark, color, task.description, { faded: !running, right })}
-          {quiet ? caption(quiet, 'warning') : running && task.lastLine ? caption(task.lastLine) : null}
-          {isOpen(key) && (
-            <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
-              {caption(`${task.kind} · started ${ago(now - task.startedAt)}${task.step ? ` during “${task.step}”` : ''}${task.bytes !== undefined ? ` · ${Math.round(task.bytes / 1024)} KB output` : ''}`)}
-              {!running && task.lastLine && caption(`Last output: ${task.lastLine}`)}
-              {actions(
-                key,
-                running
-                  ? [{ label: 'Stop', run: () => void intervene($, 'stop', target), primary: hl === 'quiet' }]
-                  : task.status === 'failed' || task.status === 'stopped'
-                    ? [{ label: 'Retry', run: () => void intervene($, 'retry', target) }]
-                    : [],
-              )}
-            </Box>
-          )}
+          {head}
+          {under}
+          {body}
         </Box>
       )
     }
@@ -912,162 +1085,196 @@ export const register: Register = on => {
       const key = `agent:${row.id}`
       const plan = b.plans[row.id]
       const p = progress(plan)
-      const hl = loopHealth(b, row.id, now)
+      const actx = contextOf(b, row.id, now, history)
+      const hl = loopHealth(b, row.id, now, history)
       const ended = ENDED.has(row.status)
       const mark = { pending: '○', running: '◐', waiting: '◷', idle: '·', completed: '✓', failed: '✗', killed: '■' }[row.status] ?? '?'
       const color = row.status === 'failed' ? 'error' : ended ? 'subtle' : hl === 'on-track' ? 'claude' : HEALTH[hl].color
       const elapsed = (row.endedAt ?? now) - row.startedAt
       const target: Target = { kind: 'loop', loop: row.id, label: row.description }
-      const trouble = !ended ? problem(hl, row.startedAt, lastActivity(b.activity, row.id), expectedStep(plan).ms) : undefined
+      const aeta = !ended ? planEta(plan, actx) : undefined
+      const frac = planFraction(plan, actx)
       const stuck = hl === 'quiet' || hl === 'slow'
-      return (
-        <Box key={key} flexDirection="column">
-          {rowLine(key, mark, color, row.description, {
-            faded: ended,
-            mini: p.total > 0 ? { done: planFraction(plan, now), estimate: 0, isComplete: p.done === p.total, tone: toneOf(hl) } : undefined,
-            miniTip: `${p.done} of ${p.total} of its own steps done${ended ? '' : `, running ${duration(elapsed)}`}.`,
-            right: `${row.type} · ${duration(elapsed)}`,
-          })}
-          {trouble && caption(trouble, HEALTH[hl].color)}
-          {isOpen(key) && (
-            <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
-              {plan && plan.steps.length > 0 && (
-                <Box flexDirection="column">
-                  {plan.steps.map(s => (
-                    <Text key={`astep:${row.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
-                      {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
-                    </Text>
-                  ))}
-                </Box>
-              )}
-              {timeline(b.activity.filter(a => a.loop === row.id), row.startedAt)}
-              {b.tasks.filter(t => t.loop === row.id).map(t => taskRow(t))}
-              {b.agents.filter(a => a.parentId === row.id).map(child => agentRow(child))}
-              {!ended &&
-                actions(
-                  key,
-                  stuck
-                    ? [
-                        { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
-                        { label: 'Stop', run: () => void intervene($, 'stop', target) },
-                      ]
-                    : hl === 'needs-you'
-                      ? []
-                      : [{ label: 'Add context', run: () => void compose($, key) }],
-                )}
-              {composer(key, target, `Context for “${row.description}”…`)}
+      const right = ended ? `${row.type} · ${duration(elapsed)}` : aeta && aeta.basis !== 'none' ? `${range(aeta)}` : `${row.type} · ${duration(elapsed)}`
+      const head = rowLine(key, mark, color, row.description, {
+        faded: ended,
+        mini: p.total > 0 ? { done: frac.measured, estimate: frac.estimated, isComplete: p.done === p.total, tone: toneOf(hl) } : undefined,
+        miniTip: [
+          `${p.done} of ${p.total} of its own steps done.`,
+          aeta && aeta.basis !== 'none' ? `About ${range(aeta)} left, from ${basisWords(aeta.basis, calibrate(plan, actx))}.` : 'No estimate for its remaining steps yet.',
+        ],
+        right,
+      })
+      const trouble = !ended && hl !== 'on-track' && hl !== 'idle' ? caption(`${HEALTH[hl].label}: ${HEALTH[hl].meaning}`, HEALTH[hl].color) : null
+      const body = isOpen(key) ? (
+        <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+          {plan && plan.steps.length > 0 && (
+            <Box flexDirection="column">
+              {plan.steps.map(s => {
+                advance(LINE)
+                return (
+                  <Text key={`astep:${row.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                    {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                  </Text>
+                )
+              })}
             </Box>
           )}
+          {timeline(b.activity.filter(a => a.loop === row.id), row.startedAt)}
+          {b.tasks.filter(t => t.loop === row.id).map(t => taskRow(t))}
+          {b.agents.filter(a => a.parentId === row.id).map(child => agentRow(child))}
+          {!ended &&
+            actions(
+              key,
+              stuck
+                ? [
+                    { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                    { label: 'Stop', run: () => void intervene($, 'stop', target) },
+                  ]
+                : hl === 'needs-you'
+                  ? []
+                  : [{ label: 'Add context', run: () => void compose($, key) }],
+            )}
+          {composer(key, target, `Context for “${row.description}”…`)}
+        </Box>
+      ) : null
+      return (
+        <Box key={key} flexDirection="column">
+          {head}
+          {trouble}
+          {body}
         </Box>
       )
     }
 
-    const main = b.plans[MAIN]
-    const steps = main?.steps ?? []
-    const exp = expectedStep(main)
-    const mainH = loopHealth(b, MAIN, now)
-
     const stepRow = (step: Step) => {
       const key = `step:${step.content}`
-      const f = stepFraction(step, now, exp.ms)
-      const current = step.status === 'in_progress'
-      const hl: Health = current ? mainH : 'on-track'
+      const est = estimateStep(step, model, ctx)
+      const isCurrent = step.status === 'in_progress'
+      const hl: Health = isCurrent ? mainH : 'on-track'
       const agents = b.agents.filter(a => !a.parentId && a.step === step.content)
       const tasks = b.tasks.filter(t => t.step === step.content)
       const acts = b.activity.filter(a => a.loop === MAIN && a.step === step.content)
-      const elapsed = step.startedAt !== undefined ? (step.completedAt ?? now) - step.startedAt : 0
-      const left = stepRemainingMs(step, now, exp.ms)
       const target: Target = { kind: 'loop', loop: MAIN, label: step.content }
-      const mark = step.status === 'completed' ? '✓' : current ? '●' : '○'
-      const markColor = step.status === 'completed' ? 'success' : current ? (hl === 'on-track' || hl === 'idle' ? 'claude' : HEALTH[hl].color) : 'subtle'
+      const mark = step.status === 'completed' ? '✓' : isCurrent ? '●' : '○'
+      const markColor = step.status === 'completed' ? 'success' : isCurrent ? (hl === 'on-track' || hl === 'idle' ? 'claude' : HEALTH[hl].color) : 'subtle'
       const right =
         step.status === 'completed'
-          ? elapsed > 0
-            ? duration(elapsed)
-            : 'done'
-          : current
-            ? `~${duration(left)} left`
-            : `~${duration(exp.ms)}`
+          ? step.isBatch || est.activeMs < 1000
+            ? 'done'
+            : duration(est.activeMs)
+          : isCurrent
+            ? est.overByMs !== undefined
+              ? `over by ${duration(est.overByMs)}`
+              : est.remainingMs !== undefined
+                ? `~${duration(est.remainingMs)} left`
+                : `${duration(est.activeMs)} so far`
+            : est.expectedMs !== undefined
+              ? `~${duration(est.expectedMs)}`
+              : 'no estimate'
       const tag = step.priority === 'next' ? 'Up next' : step.priority === 'deferred' ? 'Deferred' : step.priority === 'skip' ? 'Skipping' : undefined
       const subs = step.subSteps ?? []
       const subsDone = subs.filter(s => s.status === 'completed').length
-      const trouble = current ? problem(hl, step.startedAt, lastActivity(b.activity, MAIN), exp.ms) : undefined
+      const basis = basisWords(est.basis, model)
+      const barTip =
+        step.status === 'completed'
+          ? [
+              step.isBatch ? 'Checked off together with other steps, so its own time is unknown and it is left out of the estimates.' : `Took ${duration(est.activeMs)} of working time.`,
+              est.expectedMs !== undefined && !step.isBatch ? `Expected ~${duration(est.expectedMs)}.` : '',
+            ]
+          : step.status === 'pending'
+            ? est.expectedMs !== undefined
+              ? [`Expected ~${duration(est.expectedMs)}, from ${basis}.`, step.size ? `Sized ${step.size}.` : '']
+              : ["No estimate: the session hasn't sized this step and nothing similar has finished, so it isn't counted in the time left."]
+            : [
+                est.isEstimated
+                  ? `About ${Math.round(est.fraction * 100)}%, inferred from time: ${duration(est.activeMs)} of working time so far.`
+                  : `${Math.round(est.fraction * 100)}%, as the session reported${step.reportedAt ? ` ${ago(now - step.reportedAt)}` : ''}.`,
+                est.overByMs !== undefined
+                  ? `Past its estimate of ~${duration(est.expectedMs ?? 0)} by ${duration(est.overByMs)}; the time left is unknown, so it counts half as long again.`
+                  : est.expectedMs !== undefined
+                    ? `Expected ~${duration(est.expectedMs)} in all, from ${basis}.`
+                    : 'No estimate for this step yet.',
+                'Working time only: the clock stops while the session waits on you.',
+              ]
+      const head = rowLine(key, mark, markColor, step.content, {
+        strong: isCurrent,
+        faded: step.status === 'completed',
+        tag,
+        mini: {
+          done: est.isEstimated ? 0 : est.fraction,
+          estimate: est.isEstimated ? est.fraction : 0,
+          isComplete: step.status === 'completed',
+          tone: isCurrent ? (est.overByMs !== undefined ? 'warning' : toneOf(hl)) : 'normal',
+        },
+        miniTip: barTip,
+        right,
+      })
       const summary = step.blocker
-        ? { text: `Blocked: ${step.blocker}`, color: 'error' }
-        : trouble
-          ? { text: trouble, color: HEALTH[hl].color }
-          : current && (subs.length > 0 || step.note)
-            ? { text: [subs.length > 0 && `${subsDone}/${subs.length} parts`, step.note].filter(Boolean).join(' · '), color: undefined }
-            : undefined
+        ? caption(`Blocked: ${step.blocker}`, 'error')
+        : isCurrent && hl !== 'on-track' && hl !== 'idle'
+          ? caption(`${HEALTH[hl].label}: ${HEALTH[hl].meaning}`, HEALTH[hl].color)
+          : isCurrent && (subs.length > 0 || step.note)
+            ? caption([subs.length > 0 && `${subsDone}/${subs.length} parts`, step.note].filter(Boolean).join(' · '))
+            : null
       const nested = agents.length + tasks.length
-      const stepActions: Action[] = current
+      const nestedLine =
+        !isOpen(key) && nested > 0
+          ? caption([agents.length > 0 && `${agents.length} subagent${agents.length === 1 ? '' : 's'}`, tasks.length > 0 && `${tasks.length} background task${tasks.length === 1 ? '' : 's'}`].filter(Boolean).join(' · '))
+          : null
+      const overrun = isCurrent && (est.overByMs !== undefined || isSlipping)
+      const stepActions: Action[] = isCurrent
         ? hl === 'needs-you'
           ? []
-          : hl === 'slow'
+          : overrun
             ? [
-                { label: 'Wrap up', run: () => void intervene($, 'wrap', target), primary: true },
-                { label: 'Add context', run: () => void compose($, key) },
+                { label: 'Ask for a new estimate', run: () => void intervene($, 'estimate', target, est.overByMs !== undefined ? `over by ${duration(est.overByMs)}` : ''), primary: true },
+                { label: 'Wrap up', run: () => void intervene($, 'wrap', target) },
               ]
-            : hl === 'quiet'
+            : hl === 'slow'
               ? [
-                  { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                  { label: 'Wrap up', run: () => void intervene($, 'wrap', target), primary: true },
                   { label: 'Add context', run: () => void compose($, key) },
                 ]
-              : [{ label: 'Add context', run: () => void compose($, key) }]
+              : hl === 'quiet'
+                ? [
+                    { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                    { label: 'Add context', run: () => void compose($, key) },
+                  ]
+                : [{ label: 'Add context', run: () => void compose($, key) }]
         : step.status === 'pending'
           ? [
               { label: 'Do next', run: () => void intervene($, 'next', target) },
               { label: 'Skip', run: () => void intervene($, 'skip', target) },
             ]
           : []
-      const pctWords = `${Math.round(f.value * 100)}%`
-      const barTip =
-        step.status === 'completed'
-          ? elapsed > 0
-            ? `Done in ${duration(elapsed)}.`
-            : 'Done.'
-          : step.status === 'pending'
-            ? `Not started. Steps here usually take ~${duration(exp.ms)}${exp.samples === 0 ? ' (a starting guess until one finishes)' : ''}.`
-            : f.isEstimated
-              ? `About ${pctWords}, estimated from time: ${duration(elapsed)} so far, and steps here usually take ~${duration(exp.ms)}. The session hasn't reported progress on this step.`
-              : step.percent !== undefined
-                ? `${pctWords}, as the session reported ${step.reportedAt ? ago(now - step.reportedAt) : 'it'}.`
-                : `${pctWords}: ${subsDone} of ${subs.length} parts done.`
-      return (
-        <Box key={key} flexDirection="column">
-          {rowLine(key, mark, markColor, step.content, {
-            strong: current,
-            faded: step.status === 'completed',
-            tag,
-            mini: {
-              done: f.isEstimated ? 0 : f.value,
-              estimate: f.isEstimated ? f.value : 0,
-              isComplete: step.status === 'completed',
-              tone: current ? toneOf(hl) : 'normal',
-            },
-            miniTip: barTip,
-            right,
-          })}
-          {summary && caption(summary.text, summary.color)}
-          {!isOpen(key) && nested > 0 && caption([agents.length > 0 && `${agents.length} subagent${agents.length === 1 ? '' : 's'}`, tasks.length > 0 && `${tasks.length} background task${tasks.length === 1 ? '' : 's'}`].filter(Boolean).join(' · '))}
-          {isOpen(key) && (
-            <Box flexDirection="column" gap="sm" marginLeft="lg" marginTop="xs">
-              {subs.length > 0 && (
-                <Box flexDirection="column">
-                  {subs.map(s => (
-                    <Text key={`sub:${step.content}:${s.content}`} size="footnote" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
-                      {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
-                    </Text>
-                  ))}
-                </Box>
-              )}
-              {agents.map(a => agentRow(a))}
-              {tasks.map(t => taskRow(t))}
-              {step.status !== 'pending' && timeline(acts, step.startedAt)}
-              {actions(key, stepActions)}
-              {composer(key, target, `Context for “${step.content}”…`)}
+      const body = isOpen(key) ? (
+        <Box flexDirection="column" gap="sm" marginLeft="lg" marginTop="xs">
+          {subs.length > 0 && (
+            <Box flexDirection="column">
+              {subs.map(s => {
+                advance(LINE)
+                return (
+                  <Text key={`sub:${step.content}:${s.content}`} size="footnote" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                    {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                  </Text>
+                )
+              })}
             </Box>
           )}
+          {agents.map(a => agentRow(a))}
+          {tasks.map(t => taskRow(t))}
+          {step.status !== 'pending' && timeline(acts, step.startedAt)}
+          {actions(key, stepActions)}
+          {composer(key, target, `Context for “${step.content}”…`)}
+        </Box>
+      ) : null
+      return (
+        <Box key={key} flexDirection="column">
+          {head}
+          {summary}
+          {nestedLine}
+          {body}
         </Box>
       )
     }
@@ -1075,29 +1282,15 @@ export const register: Register = on => {
     // ── This session ────────────────────────────────────────────────────
 
     const p = progress(main)
-    const frac = planFraction(main, now)
-    const eta = planEta(main, now)
-    const overall = sessionHealth(b, now)
+    const frac = planFraction(main, ctx)
+    const overall = sessionHealth(b, now, history)
     const scope = describeScope(main, now)
     const stepNames = new Set(steps.map(s => s.content))
     const loose = b.agents.filter(a => !a.parentId && (!a.step || !stepNames.has(a.step)))
     const tasksRunning = b.tasks.filter(t => t.status === 'running')
     const tasksShown = [...tasksRunning, ...b.tasks.filter(t => t.status !== 'running').slice(-3)]
     const latest = [...b.interventions].reverse().find(i => i.status === 'pending' || now - (i.deliveredAt ?? i.at) < 2 * 60_000)
-    const measured = steps.reduce((sum, s) => {
-      const f = stepFraction(s, now, exp.ms)
-      return sum + (f.isEstimated ? 0 : f.value)
-    }, 0)
-    const spec: BarSpec = {
-      done: steps.length ? measured / steps.length : 0,
-      estimate: steps.length ? frac - measured / steps.length : 0,
-      isComplete: p.total > 0 && p.done === p.total,
-      tone: toneOf(overall),
-    }
-    const etaTip = (x: Eta) =>
-      (exp.samples > 0
-        ? `Time left: ${p.total - p.done} steps at ~${duration(exp.ms)} each, from ${exp.samples} finished.`
-        : `Time left assumes ~${duration(exp.ms)} a step until one finishes.`) + (x.isRough ? ' Rough until 3 finish.' : '')
+    const spec: BarSpec = { done: frac.measured, estimate: frac.estimated, isComplete: p.total > 0 && p.done === p.total, tone: toneOf(overall) }
     const deliveredWords = (i: Intervention) =>
       i.status === 'pending'
         ? 'waiting for its next step'
@@ -1111,67 +1304,130 @@ export const register: Register = on => {
                 ? 'done'
                 : 'sent as a message'
 
-    const session = (
-      <Box flexDirection="column" gap="sm">
-        {sectionLabel('This session')}
-        {steps.length === 0 ? (
-          caption('No plan yet. It appears here as soon as the session writes its task list.')
-        ) : (
-          <Box flexDirection="column" gap="xs">
-            <Box key="summary" flexDirection="row" justifyContent="space-between" alignItems="flex-end" gap="sm">
-              <Box flexShrink={1}>
-                <Text weight="semibold" wrap="truncate-end">
-                  {here}
-                </Text>
-              </Box>
-              <Box flexDirection="row" gap="sm" flexShrink={0}>
-                <Text mono dimColor>
-                  {p.done}/{p.total}
-                </Text>
-                <Text mono weight="semibold">
-                  {percent(frac)}
-                </Text>
-              </Box>
-            </Box>
-            <Box>
-              {tip(
-                'bar:main',
-                bar(spec, 8),
-                `${p.done} of ${p.total} steps done (${percent(frac).trim()} counting the step in progress).${spec.estimate > 0.005 ? ' The pale part is that step, estimated from time.' : ''}`,
-              )}
-            </Box>
-            {tip(
-              'status',
-              <Box key="status" flexDirection="row" justifyContent="space-between" alignItems="center" gap="sm">
-                {badge(overall)}
-                {eta && (
-                  <Box flexDirection="row" gap="xs" alignItems="center">
-                    <Text size="footnote" dimColor>
-                      {range(eta)} left{eta.isRough ? ' · rough' : ''}
-                    </Text>
-                    {infoIcon()}
-                  </Box>
-                )}
-              </Box>,
-              // Short: it floats up into the few rows above the line.
-              [`${HEALTH[overall].label}: ${HEALTH[overall].meaning}`, eta && etaTip(eta)].filter(Boolean).join(' '),
-            )}
-            {scope &&
-              tip(
-                'scope',
-                <Box key="scope" flexDirection="row" gap="xs" alignItems="center">
-                  <Box flexShrink={1} minWidth={0}>
-                    {caption(scope.headline)}
-                  </Box>
-                  {infoIcon()}
-                </Box>,
-                scope.detail.join(' '),
-              )}
-            {latest && caption(`${INTERVENTION_LABEL[latest.kind]} · ${latest.label} — ${deliveredWords(latest)}`, latest.status === 'failed' ? 'error' : undefined)}
-          </Box>
-        )}
+    // The ETA says what it rests on, always: a number with its basis, or
+    // plainly that there is no estimate yet.
+    const etaText = !eta
+      ? undefined
+      : eta.basis === 'none'
+        ? 'no estimate yet'
+        : `${range(eta)} ${isPaused ? 'of work left' : 'left'} · ${BASIS_TAG[eta.basis] ?? eta.basis}${eta.unknown > 0 ? ` +${eta.unknown} unsized` : ''}`
+    const etaSentences = !eta
+      ? []
+      : eta.basis === 'none'
+        ? [
+            'No estimate yet: no step is sized and none has finished.',
+            'It appears once the session sizes its steps (it is asked to when it writes its plan) or a step finishes.',
+          ]
+        : [
+            `From ${basisWords(eta.basis, model)}; ${eta.confidence} confidence.`,
+            eta.unknown > 0 ? `${eta.unknown} step${eta.unknown === 1 ? ' has' : 's have'} no size yet and ${eta.unknown === 1 ? 'is' : 'are'}n't counted.` : '',
+            eta.isOverrun ? 'A step is past its estimate, so the range is widened.' : '',
+            isPaused ? 'Paused: the clock only runs while the session works.' : 'Counts working time only.',
+          ]
+
+    advance(LINE) // section label
+    const sectionHead = (
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text size="caption" weight="semibold" dimColor>
+          THIS SESSION
+        </Text>
       </Box>
     )
+    let session: ReturnType<typeof h>
+    if (steps.length === 0) {
+      session = (
+        <Box flexDirection="column" gap="sm">
+          {sectionHead}
+          {caption('No plan yet. It appears here as soon as the session writes its task list.')}
+        </Box>
+      )
+    } else {
+      advance(1) // name and count
+      const summaryRow = (
+        <Box key="summary" flexDirection="row" justifyContent="space-between" alignItems="flex-end" gap="sm">
+          <Box flexShrink={1} minWidth={0}>
+            <Text weight="semibold" wrap="truncate-end">
+              {here}
+            </Text>
+          </Box>
+          <Box flexDirection="row" gap="sm" flexShrink={0}>
+            <Text mono dimColor>
+              {p.done}/{p.total}
+            </Text>
+            <Text mono weight="semibold">
+              {percent(frac.measured + frac.estimated)}
+            </Text>
+          </Box>
+        </Box>
+      )
+      const barAt = y
+      const mainBar = tip(
+        'bar:main',
+        bar(spec, 8),
+        [
+          `${p.done} of ${p.total} steps done.`,
+          spec.estimate > 0.005 ? 'The pale part is the step in progress, inferred from its working time.' : '',
+        ],
+        barAt,
+      )
+      const statusAt = y
+      advance(LINE)
+      const statusLine = tip(
+        'status',
+        <Box key="status" flexDirection="row" justifyContent="space-between" alignItems="center" gap="sm">
+          {badge(overall)}
+          {etaText && (
+            <Box flexDirection="row" gap="xs" alignItems="center" flexShrink={1} minWidth={0}>
+              <Text size="footnote" dimColor wrap="truncate-end">
+                {etaText}
+              </Text>
+              {infoIcon()}
+            </Box>
+          )}
+        </Box>,
+        [...etaSentences, `${HEALTH[overall].label}: ${HEALTH[overall].meaning}`],
+        statusAt,
+      )
+      const slipLine = isSlipping
+        ? caption(
+            `Finish moved ${slip.movedMs > 0 ? `+${duration(slip.movedMs)} later ` : ''}in the last ${duration(slip.sinceMs)}${slip.count > 0 ? ` (${slip.count} slip${slip.count === 1 ? '' : 's'})` : ''}`,
+            'warning',
+          )
+        : null
+      const scopeAt = y
+      const scopeLine = scope
+        ? (() => {
+            advance(LINE)
+            return tip(
+              'scope',
+              <Box key="scope" flexDirection="row" gap="xs" alignItems="center">
+                <Box flexShrink={1} minWidth={0}>
+                  <Text size="caption" dimColor wrap="truncate-end">
+                    {scope.headline}
+                  </Text>
+                </Box>
+                {infoIcon()}
+              </Box>,
+              scope.detail,
+              scopeAt,
+            )
+          })()
+        : null
+      const latestLine = latest ? caption(`${INTERVENTION_LABEL[latest.kind]} · ${latest.label} — ${deliveredWords(latest)}`, latest.status === 'failed' ? 'error' : undefined) : null
+      session = (
+        <Box flexDirection="column" gap="sm">
+          {sectionHead}
+          <Box flexDirection="column" gap="xs">
+            {summaryRow}
+            <Box>{mainBar}</Box>
+            {statusLine}
+            {slipLine}
+            {scopeLine}
+            {latestLine}
+          </Box>
+        </Box>
+      )
+    }
 
     const stepList = steps.length > 0 && (
       <Box flexDirection="column" gap="xs">
@@ -1196,68 +1452,84 @@ export const register: Register = on => {
 
     // ── Other sessions ──────────────────────────────────────────────────
 
-    const othersBlock = (
-      <Box flexDirection="column" gap="xs">
-        {sectionLabel('Other sessions')}
-        {others.length === 0 ? (
-          caption('None reporting yet. Sessions started since Headway was installed show up here.')
-        ) : (
-          <Box flexDirection="column" gap="sm">
-            {others.map(one => {
-              const key = `session:${one.id}`
-              const stale = now - one.updatedAt > STALE_MS
-              const hl: Health = stale && one.health !== 'done' ? 'idle' : one.health
-              const op: BarSpec = { done: one.total ? one.done / one.total : 0, estimate: 0, isComplete: one.total > 0 && one.done === one.total, tone: toneOf(hl) }
-              const target: Target = { kind: 'session', summary: one, label: one.active ?? one.name }
-              const stuck = hl === 'slow' || hl === 'quiet' || stale
-              return (
-                <Box key={key} flexDirection="column" gap="xs">
-                  <Box flexDirection="row" gap="sm" alignItems="center">
-                    {toggleButton(key)}
-                    <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                      <Text weight="medium" wrap="truncate-end">
-                        {one.name}
-                      </Text>
-                    </Box>
-                    <Text mono dimColor>
-                      {one.done}/{one.total}
-                    </Text>
-                    <Text mono weight="semibold">
-                      {percent(op.done)}
-                    </Text>
-                  </Box>
-                  {tip(`bar:${key}`, bar(op, 6), `${one.done} of ${one.total} steps done · updated ${ago(now - one.updatedAt)}.`)}
-                  {caption(
-                    [HEALTH[hl].label, one.eta && `${range({ ...one.eta, ms: 0 })} left`, one.active].filter(Boolean).join(' · '),
-                    hl === 'on-track' || hl === 'done' || hl === 'idle' ? undefined : HEALTH[hl].color,
-                  )}
-                  {isOpen(key) && (
-                    <Box flexDirection="column" gap="xs" marginLeft="lg">
-                      {one.steps.map(s => (
-                        <Text key={`os:${one.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
-                          {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
-                        </Text>
-                      ))}
-                      {caption(`Updated ${ago(now - one.updatedAt)}${one.agentsRunning ? ` · ${one.agentsRunning} subagents` : ''}${one.tasksRunning ? ` · ${one.tasksRunning} background tasks` : ''}`)}
-                      {actions(
-                        key,
-                        stuck
-                          ? [
-                              { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
-                              { label: 'Add context', run: () => void compose($, key) },
-                            ]
-                          : [{ label: 'Add context', run: () => void compose($, key) }],
-                      )}
-                      {composer(key, target, `Context for ${one.name}…`)}
-                    </Box>
-                  )}
+    const othersLabel = sectionLabel('Other sessions')
+    const othersBody =
+      others.length === 0 ? (
+        caption('None reporting yet. Sessions started since Headway was installed show up here.')
+      ) : (
+        <Box flexDirection="column" gap="sm">
+          {others.map(one => {
+            const key = `session:${one.id}`
+            const stale = now - one.updatedAt > STALE_MS
+            const hl: Health = stale && one.health !== 'done' ? 'idle' : one.health
+            const op: BarSpec = { done: one.total ? one.done / one.total : 0, estimate: 0, isComplete: one.total > 0 && one.done === one.total, tone: toneOf(hl) }
+            const target: Target = { kind: 'session', summary: one, label: one.active ?? one.name }
+            const stuck = hl === 'slow' || hl === 'quiet' || stale
+            advance(1)
+            const headLine = (
+              <Box flexDirection="row" gap="sm" alignItems="center">
+                {toggleButton(key)}
+                <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                  <Text weight="medium" wrap="truncate-end">
+                    {one.name}
+                  </Text>
                 </Box>
-              )
-            })}
-          </Box>
-        )}
-      </Box>
-    )
+                <Text mono dimColor>
+                  {one.done}/{one.total}
+                </Text>
+                <Text mono weight="semibold">
+                  {percent(op.done)}
+                </Text>
+              </Box>
+            )
+            const at = y
+            const barLine = tip(
+              `bar:${key}`,
+              bar(op, 6),
+              [
+                `${one.done} of ${one.total} steps done, updated ${ago(now - one.updatedAt)}.`,
+                one.eta ? `About ${range(one.eta)} left, from ${one.eta.basis}.` : 'No estimate yet.',
+              ],
+              at,
+            )
+            const line = caption(
+              [HEALTH[hl].label, one.eta && `${range(one.eta)} left`, one.active].filter(Boolean).join(' · '),
+              hl === 'on-track' || hl === 'done' || hl === 'idle' ? undefined : HEALTH[hl].color,
+            )
+            const body = isOpen(key) ? (
+              <Box flexDirection="column" gap="xs" marginLeft="lg">
+                {one.steps.map(s => {
+                  advance(LINE)
+                  return (
+                    <Text key={`os:${one.id}:${s.content}`} size="caption" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
+                      {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
+                    </Text>
+                  )
+                })}
+                {caption(`Updated ${ago(now - one.updatedAt)}${one.agentsRunning ? ` · ${one.agentsRunning} subagents` : ''}${one.tasksRunning ? ` · ${one.tasksRunning} background tasks` : ''}`)}
+                {actions(
+                  key,
+                  stuck
+                    ? [
+                        { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+                        { label: 'Add context', run: () => void compose($, key) },
+                      ]
+                    : [{ label: 'Add context', run: () => void compose($, key) }],
+                )}
+                {composer(key, target, `Context for ${one.name}…`)}
+              </Box>
+            ) : null
+            return (
+              <Box key={key} flexDirection="column" gap="xs">
+                {headLine}
+                {barLine}
+                {line}
+                {body}
+              </Box>
+            )
+          })}
+        </Box>
+      )
 
     return (
       <Box flexDirection="column" gap="lg" paddingX="xs" paddingY="xs" width="100%">
@@ -1265,7 +1537,10 @@ export const register: Register = on => {
         {stepList}
         {subagents}
         {background}
-        {othersBlock}
+        <Box flexDirection="column" gap="xs">
+          {othersLabel}
+          {othersBody}
+        </Box>
       </Box>
     )
   })
