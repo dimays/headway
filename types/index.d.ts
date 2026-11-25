@@ -139,6 +139,8 @@ export type Board = {
   waits: Interval[]
   /** The projected finish time, sampled, to show when an estimate slips. */
   etaLog: { at: number; finish: number }[]
+  /** The session's title as the app shows it, when the engine has told us. */
+  title?: string
 }
 
 /** What the pane shows open, kept apart from the data it draws. */

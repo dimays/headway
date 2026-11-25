@@ -286,6 +286,14 @@ async function markIntervention($: EngineInterface, id: string, patch: Partial<I
   }))
 }
 
+/** Keeps the session's title, as the app names it, for the pane and the other sessions. */
+async function keepTitle($: EngineInterface, raw: unknown) {
+  const title = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim().slice(0, 80) : ''
+  if (!title) return
+  const b = await getBoard($)
+  if (b.title !== title) await changeBoard($, x => ({ ...x, title }))
+}
+
 /** Publishes this session's summary to the shared store and reads everyone else's. */
 async function syncSessions($: EngineInterface, id: string) {
   const now = await $.clock.now()
@@ -299,7 +307,7 @@ async function syncSessions($: EngineInterface, id: string) {
     const model = calibrate(main, contextOf(b, MAIN, now, history ?? {}))
     const mine: SessionSummary = {
       id,
-      name: basename(root),
+      name: b.title || basename(root),
       root,
       done: p.done,
       total: p.total,
@@ -711,6 +719,18 @@ export const register: Register = on => {
     }
   })
 
+  // The app's title for the session arrives with each prompt (and on start),
+  // so a rename shows from the next prompt on.
+  on('classic.SessionStart', async ($, e, next) => {
+    await keepTitle($, e.session_title)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    await keepTitle($, e.session_title)
+    return next(e)
+  }).catch(($, e, next) => next(e)) // never hold a prompt over a headway bug
+
   on('classic.PermissionRequest', async ($, e, next) => {
     const loop = (e as unknown as { agent_id?: string }).agent_id ?? MAIN
     const now = await $.clock.now()
@@ -776,7 +796,9 @@ export const register: Register = on => {
     const storedHistory = await read($, historyAtom)
     const history: Record<string, number[]> = storedHistory && typeof storedHistory === 'object' ? storedHistory : {}
     const now = await $.clock.now()
-    const here = basename(await $.session.root())
+    // The session's title, not its folder: the app reuses worktree folders,
+    // so a folder can carry the name of an older, unrelated session.
+    const here = b.title || basename(await $.session.root())
     const columns = Math.max(24, e.props.bodyColumns ?? 40)
     const scrollTop = e.props.scroll?.offset ?? 0
     const isOpen = (key: string) => view.open.includes(key)

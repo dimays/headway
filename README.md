@@ -91,7 +91,7 @@ The pane opens on its own in each new session. `/headway` reopens it;
 - **Background tasks.** Background shell commands, monitors and workflows
   get rows of their own, even outside any plan, with their latest output
   line and a warning when they go quiet.
-- **Your other sessions,** each with its bar, health, ETA and current step.
+- **Your other sessions,** each by its title, with its bar, health, ETA and current step.
 
 ## Steering from the pane
 

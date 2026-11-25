@@ -23,9 +23,17 @@ type Dollar = Parameters<TestBody>[0]
 type On = Parameters<TestBody>[1]
 
 // Nothing sits beneath the plugin in a test: these hooks stand for the engine.
-function engine(on: On) {
+function engine(on: On, store: Map<string, unknown> | undefined = undefined) {
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.store(on)
+  if (store) {
+    // A store the test can look into, for what the session publishes.
+    on('store.get', (_, e) => ({ value: store.get(e.key) }))
+    on('store.set', (_, e) => (store.set(e.key, e.value), { value: undefined }))
+    on('store.delete', (_, e) => (store.delete(e.key), { value: undefined }))
+    on('store.keys', () => ({ value: [...store.keys()] }))
+  } else {
+    mock.store(on)
+  }
   const submitted: string[] = []
   on('command.register', () => ({ value: { command: 'headway' } }))
   on('tool.register', () => ({ value: { tool: 'mcp__headway__report_progress' } }))
@@ -506,4 +514,28 @@ test('a board an earlier shape stored is declined', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /No plan yet/ })).toBeDefined()
   await ui.unmount()
+})
+
+test("a session goes by its title, not its folder, which the app may have reused", async ($, on) => {
+  const store = new Map<string, unknown>()
+  const { clock } = engine(on, store)
+  on('classic.UserPromptSubmit', () => ({}))
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Plan the release', 'Ship') })
+
+  // Before the engine names it, the folder is all there is.
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'summary' }))?.text).toContain('demo')
+  await ui.unmount()
+
+  await $.classic.UserPromptSubmit({ prompt: 'go', session_title: '2.1.0 release planning' })
+  await clock.advance(6000)
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const summary = (await ui.find({ key: 'summary' }))?.text
+  expect(summary).toContain('2.1.0 release planning')
+  expect(summary).not.toContain('demo')
+  await ui.unmount()
+  const mine = store.get('session:session-1') as { name: string; root: string } | undefined
+  expect(mine?.name).toBe('2.1.0 release planning')
+  expect(mine?.root).toBe('/work/demo')
 })
