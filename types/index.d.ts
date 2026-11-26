@@ -1,7 +1,7 @@
 export type StepStatus = 'pending' | 'in_progress' | 'completed'
 
 /** A part of a step, as the model reports it through `report_progress`. */
-export type SubStep = { content: string; status: StepStatus }
+export type SubStep = { content: string; status: StepStatus; percent?: number }
 
 export type Step = {
   content: string
@@ -23,6 +23,15 @@ export type Step = {
   estMinutes?: number
   /** Checked off together with other steps in one update: its timing is not real. */
   isBatch?: boolean
+  /** What closed it, when not the plan itself: a report of 100% or every part done. */
+  closedBy?: 'report'
+}
+
+/** A step that left the plan, kept for the Archive section. */
+export type ArchivedStep = Step & {
+  archivedAt: number
+  /** `done`: finished, then dropped from the list; `superseded`: dropped before it finished. */
+  reason: 'done' | 'superseded'
 }
 
 export type StepSize = 'S' | 'M' | 'L' | 'XL'
@@ -47,6 +56,8 @@ export type Plan = {
   peak: number
   createdAt: number
   updatedAt: number
+  /** Steps a later plan dropped, newest last. */
+  archived?: ArchivedStep[]
 }
 
 export type AgentRow = {
@@ -60,6 +71,10 @@ export type AgentRow = {
   step?: string
   startedAt: number
   endedAt?: number
+  /** What ended it: the engine's report, a task notification, or the engine dropping it. */
+  endedBy?: 'report' | 'notification' | 'gone' | 'list'
+  /** A subagent with no plan of its own keeps its report_progress here. */
+  report?: { percent?: number; note?: string; subSteps?: SubStep[]; at: number }
 }
 
 /** One tool call, for the activity timeline and for spotting a loop gone quiet. */
@@ -95,6 +110,8 @@ export type BgTask = {
   lastLine?: string
   lastOutputAt?: number
   timeoutMs?: number
+  /** What ended it: a task notification, a turn's end that no longer listed it, a stop. */
+  endedBy?: 'notification' | 'turn-end' | 'stop' | 'timeout'
 }
 
 export type InterventionKind =
@@ -150,6 +167,7 @@ export type View = {
   /** The row whose "add context" field is showing. */
   composing?: string
 }
+// The Archive section's open state is the key `archive` in `open`.
 
 export type Health = 'on-track' | 'slow' | 'quiet' | 'needs-you' | 'failed' | 'done' | 'idle'
 

@@ -1,7 +1,7 @@
 // Pure logic: turning task-list tool calls into plans, and plans into numbers.
 // Nothing here touches `$`, so it is easy to test and to reason about.
 
-import type { Plan, ScopeChange, Step, StepSize, StepStatus, SubStep } from '../types'
+import type { Activity, AgentRow, ArchivedStep, BgTask, Plan, ScopeChange, Step, StepSize, StepStatus, SubStep } from '../types'
 
 export const EMPTY_PLAN: Plan = { steps: [], changes: [], peak: 0, createdAt: 0, updatedAt: 0 }
 
@@ -15,8 +15,95 @@ function toItems(raw: unknown): SubStep[] | undefined {
   if (!Array.isArray(raw)) return undefined
   return raw
     .filter((one): one is Record<string, unknown> => !!one && typeof one === 'object')
-    .map(one => ({ content: String(one.content ?? '').trim(), status: toStatus(one.status) }))
+    .map(one => {
+      const item: SubStep = { content: String(one.content ?? '').trim(), status: toStatus(one.status) }
+      if (typeof one.percent === 'number' && Number.isFinite(one.percent)) item.percent = Math.min(100, Math.max(0, one.percent))
+      return item
+    })
     .filter(one => one.content.length > 0)
+}
+
+// ── Matching names ───────────────────────────────────────────────────────
+// The model names a step again in its own words: a report on "the tests" for
+// "Run the tests", a rewritten plan that says "Fix the reopen bug" for "Fix
+// reopen". Matching tolerantly keeps those updates instead of dropping them.
+
+const FILLER = new Set(['a', 'an', 'the', 'and', 'or', 'to', 'of', 'for', 'in', 'on', 'with', 'step', 'it', 'its', 'this', 'that'])
+
+/** The words of a name that carry its meaning: lowercased, punctuation and filler dropped, plurals folded. */
+export function wordsOf(name: string): string[] {
+  return name
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .split(/\s+/)
+    .filter(w => w && !FILLER.has(w))
+    .map(w => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w))
+}
+
+function overlap(a: string[], b: string[]): { shared: number; jaccard: number; aInB: boolean; bInA: boolean } {
+  const A = new Set(a)
+  const B = new Set(b)
+  let shared = 0
+  for (const w of A) if (B.has(w)) shared++
+  const union = A.size + B.size - shared
+  return { shared, jaccard: union === 0 ? 0 : shared / union, aInB: A.size > 0 && shared === A.size, bInA: B.size > 0 && shared === B.size }
+}
+
+/**
+ * Whether two names are the same step, reworded: the same words, one's words
+ * all inside the other's, or nearly all shared. Strict on purpose: it decides
+ * whether a step's timing and reports carry into a rewritten plan.
+ */
+export function sameStep(a: string, b: string): boolean {
+  if (a === b) return true
+  const wa = wordsOf(a)
+  const wb = wordsOf(b)
+  if (wa.length === 0 || wb.length === 0) return a.trim().toLowerCase() === b.trim().toLowerCase()
+  const o = overlap(wa, wb)
+  return o.aInB || o.bInA || o.jaccard >= 0.75
+}
+
+/**
+ * The step a name in a report means, or -1: exact, then the same words, then
+ * one name inside the other, then "3" or "step 3", then the step sharing the
+ * most words (at least half of the shorter name's).
+ */
+export function matchStep(steps: readonly { content: string }[], name: string): number {
+  const exact = steps.findIndex(s => s.content === name)
+  if (exact >= 0) return exact
+  const lower = name.trim().toLowerCase()
+  const folded = steps.findIndex(s => s.content.trim().toLowerCase() === lower)
+  if (folded >= 0) return folded
+  const wn = wordsOf(name)
+  const key = wn.join(' ')
+  if (key) {
+    const same = steps.findIndex(s => wordsOf(s.content).join(' ') === key)
+    if (same >= 0) return same
+  }
+  const inside = steps.findIndex(s => {
+    const c = s.content.toLowerCase()
+    return c.includes(lower) || lower.includes(c)
+  })
+  if (inside >= 0 && lower.length >= 3) return inside
+  const numbered = /^(?:step\s*)?#?(\d{1,2})$/i.exec(name.trim())
+  if (numbered) {
+    const i = Number(numbered[1]) - 1
+    return steps[i] ? i : -1
+  }
+  let best = -1
+  let bestScore = 0
+  steps.forEach((s, i) => {
+    const ws = wordsOf(s.content)
+    const o = overlap(wn, ws)
+    const need = Math.max(1, Math.ceil(Math.min(wn.length, ws.length) / 2))
+    if (o.shared < need) return
+    const score = o.jaccard + (o.aInB || o.bInA ? 0.5 : 0)
+    if (score > bestScore) {
+      bestScore = score
+      best = i
+    }
+  })
+  return best
 }
 
 /** Moves a step to a status, stamping when it started and finished. */
@@ -57,23 +144,60 @@ function markBatch(before: Step[], after: Step[]): Step[] {
   return after.map(s => (names.has(s.content) ? { ...s, isBatch: true } : s))
 }
 
-/** Replaces the step list, carrying each surviving step's timing and reports. */
+const ARCHIVE_LIMIT = 60
+
+/**
+ * Pairs each new item with the old step it continues: the same name first,
+ * then (for the rest) the same step reworded. A finished step only continues
+ * as a finished one, so a new step never inherits an old step's timing.
+ */
+function pairUp(before: Step[], items: SubStep[]): (Step | undefined)[] {
+  const used = new Set<number>()
+  const pairs: (Step | undefined)[] = items.map(item => {
+    const i = before.findIndex((s, j) => !used.has(j) && s.content === item.content)
+    if (i < 0) return undefined
+    used.add(i)
+    return before[i]
+  })
+  items.forEach((item, k) => {
+    if (pairs[k]) return
+    const i = before.findIndex(
+      (s, j) => !used.has(j) && (s.status !== 'completed' || item.status === 'completed') && sameStep(s.content, item.content),
+    )
+    if (i < 0) return
+    used.add(i)
+    pairs[k] = before[i]
+  })
+  return pairs
+}
+
+/** Replaces the step list, carrying each surviving step's timing and reports; dropped steps go to the archive. */
 function replace(plan: Plan, items: SubStep[], at: number): Plan {
-  const old = new Map(plan.steps.map(s => [s.content, s]))
+  const pairs = pairUp(plan.steps, items)
   const steps = markBatch(
-    plan.steps,
-    items.map(item => {
-      const kept: Step = old.get(item.content) ?? { content: item.content, status: 'pending' }
+    plan.steps.map(s => {
+      // Renamed steps compare by their new name.
+      const k = pairs.indexOf(s)
+      return k >= 0 ? { ...s, content: items[k]!.content } : s
+    }),
+    items.map((item, k) => {
+      const kept: Step = pairs[k] ? { ...pairs[k]!, content: item.content } : { content: item.content, status: 'pending' }
       return moveTo(kept, item.status, at)
     }),
   )
+  const kept = new Set(pairs.filter(Boolean))
+  const dropped: ArchivedStep[] = plan.steps
+    .filter(s => !kept.has(s))
+    .map(s => ({ ...s, archivedAt: at, reason: s.status === 'completed' ? 'done' : 'superseded' }))
   const change = scopeChange(plan.steps, steps, at)
+  const archived = dropped.length > 0 ? [...(plan.archived ?? []), ...dropped].slice(-ARCHIVE_LIMIT) : plan.archived
   return {
     steps,
     changes: change ? [...plan.changes, change].slice(-20) : plan.changes,
     peak: Math.max(plan.peak, steps.length),
     createdAt: plan.createdAt || at,
     updatedAt: at,
+    ...(archived ? { archived } : {}),
   }
 }
 
@@ -159,21 +283,17 @@ export function toReport(args: Record<string, unknown>): Report {
 }
 
 /**
- * Applies a report to the named step, or the one in progress. Returns the plan
- * unchanged with `matched: false` when there is no such step.
+ * Applies a report to the named step (matched tolerantly), or the one in
+ * progress. A report is evidence of the step's status too: progress on a step
+ * not started starts it; 100%, or every part done, finishes it. Returns the
+ * plan unchanged with `matched: undefined` when there is no such step.
  */
-function findStep(steps: Step[], name: string): number {
-  const lower = name.toLowerCase()
-  const exact = steps.findIndex(s => s.content.toLowerCase() === lower)
-  return exact >= 0 ? exact : steps.findIndex(s => s.content.toLowerCase().includes(lower) || lower.includes(s.content.toLowerCase()))
-}
-
 export function applyReport(plan: Plan, r: Report, at: number): { plan: Plan; matched: string | undefined; sized: number } {
   let sized = 0
   if (r.sizes) {
     const steps = [...plan.steps]
     for (const z of r.sizes) {
-      const i = findStep(steps, z.step)
+      const i = matchStep(steps, z.step)
       const step = steps[i]
       if (!step) continue
       steps[i] = { ...step, size: z.size ?? step.size, estMinutes: z.minutes ?? step.estMinutes }
@@ -183,18 +303,21 @@ export function applyReport(plan: Plan, r: Report, at: number): { plan: Plan; ma
   }
   const hasStepReport = r.step || r.subSteps || r.percent !== undefined || r.etaMinutes !== undefined || r.blocker !== undefined || r.note
   if (!hasStepReport) return { plan, matched: undefined, sized }
-  const lower = r.step?.toLowerCase()
-  let index = lower ? plan.steps.findIndex(s => s.content.toLowerCase() === lower) : -1
-  if (index < 0 && lower) index = plan.steps.findIndex(s => s.content.toLowerCase().includes(lower))
+  let index = r.step ? matchStep(plan.steps, r.step) : -1
   if (index < 0) index = plan.steps.findIndex(s => s.status === 'in_progress')
   const step = plan.steps[index]
   if (!step) return { plan, matched: undefined, sized }
-  const next: Step = { ...step, reportedAt: at }
+  let next: Step = { ...step, reportedAt: at }
   if (r.subSteps) next.subSteps = r.subSteps
   if (r.percent !== undefined) next.percent = r.percent
   if (r.etaMinutes !== undefined) next.etaMinutes = r.etaMinutes
   if (r.blocker !== undefined) next.blocker = r.blocker || undefined
   if (r.note !== undefined) next.note = r.note
+  const parts = r.subSteps ?? []
+  const isFinished = r.percent === 100 || (parts.length > 0 && parts.every(p => p.status === 'completed'))
+  const isMoving = (r.percent ?? 0) > 0 || parts.some(p => p.status !== 'pending')
+  if (isFinished && next.status !== 'completed') next = { ...moveTo(next, 'completed', at), closedBy: 'report' }
+  else if (isMoving && next.status === 'pending') next = moveTo(next, 'in_progress', at)
   const steps = plan.steps.map((s, i) => (i === index ? next : s))
   return { plan: { ...plan, steps, updatedAt: at }, matched: step.content, sized }
 }
@@ -214,3 +337,24 @@ export function activeStep(plan: Plan | undefined): string | undefined {
 }
 
 export const ENDED = new Set(['completed', 'failed', 'killed'])
+
+// ── Evidence of life ─────────────────────────────────────────────────────
+
+/**
+ * The last moment anything showed that a step is being worked on: it started,
+ * a report on it, a tool call made on it, or a subagent or background task
+ * working on it. Undefined for a step that never started.
+ */
+export function stepSignalAt(
+  step: Step,
+  activity: readonly Activity[],
+  agents: readonly AgentRow[],
+  tasks: readonly BgTask[],
+): number | undefined {
+  if (step.startedAt === undefined) return undefined
+  let at = Math.max(step.startedAt, step.reportedAt ?? 0)
+  for (const a of activity) if (a.step === step.content) at = Math.max(at, a.endedAt ?? a.startedAt)
+  for (const g of agents) if (g.step === step.content) at = Math.max(at, g.endedAt ?? g.startedAt, g.report?.at ?? 0)
+  for (const t of tasks) if (t.step === step.content) at = Math.max(at, t.endedAt ?? t.lastOutputAt ?? t.startedAt)
+  return at
+}
