@@ -4,6 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type {
   Activity,
   AgentRow,
+  ArchivedStep,
   BgTask,
   Board,
   Health,
@@ -12,6 +13,7 @@ import type {
   Plan,
   SessionSummary,
   Step,
+  SubStep,
   View,
 } from '../types'
 import {
@@ -23,6 +25,7 @@ import {
   applyUpdatePlan,
   applyWrapUp,
   progress,
+  stepSignalAt,
   toReport,
 } from './plan'
 import {
@@ -60,6 +63,12 @@ const STORE_PREFIX = 'session:'
 const STALE_MS = 15 * 60_000
 const FORGET_MS = 7 * 24 * 60 * 60_000
 const TASK_QUIET_MS = 5 * 60_000
+/** A finished step, subagent or task stays in its section this long before it moves to the Archive. */
+const RECENT_MS = 2 * 60_000
+/** A row the engine has not listed this long after it started is not merely late to appear. */
+const GRACE_MS = 10_000
+/** The default for the `staleMinutes` option: a step in progress with no sign of work this long reads "stale?". */
+const STALE_MINUTES = 10
 /** A note for a running loop that has made no tool call this long goes as a message instead. */
 const NEXT_STEP_PATIENCE_MS = 60_000
 const TAIL_LIMIT = 256 * 1024
@@ -115,6 +124,7 @@ const REPORT_SCHEMA = {
         properties: {
           content: { type: 'string' },
           status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          percent: { type: 'number', description: 'Optional: rough percent of this part done.' },
         },
         required: ['content', 'status'],
       },
@@ -137,25 +147,41 @@ async function getBoard($: EngineInterface): Promise<Board> {
   return asBoard(value)
 }
 
-/** Read-modify-write with a version check, retried if another hook wrote first. */
+// Writes go one at a time. Every hook of this module shares one queue, so
+// parallel subagents' tool calls, timers and reports never race each other
+// for the board's version: under a burst of them the old retry loop could run
+// out of attempts and drop an update without a word.
+let queueTail: Promise<unknown> = Promise.resolve()
+function serially<T>(job: () => Promise<T>): Promise<T> {
+  const run = queueTail.then(job, job)
+  queueTail = run.catch(() => undefined)
+  return run
+}
+
+/** Read-modify-write, one at a time, with a version check in case another process wrote first. */
 async function changeBoard($: EngineInterface, change: (b: Board) => Board) {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const held = await $.state.get(BOARD)
-    const before = asBoard(held.value)
-    const after = change(before)
-    if (after === before) return
-    const { isSet } = await $.state.set(BOARD, { shape: SHAPE, value: after }, { ifVersion: held.version })
-    if (isSet) return
-  }
+  await serially(async () => {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const held = await $.state.get(BOARD)
+      const before = asBoard(held.value)
+      const after = change(before)
+      if (after === before) return
+      const { isSet } = await $.state.set(BOARD, { shape: SHAPE, value: after }, { ifVersion: held.version })
+      if (isSet) return
+    }
+    $.ui.log('headway: a board update gave way to 20 writes from elsewhere and was dropped')
+  })
 }
 
 async function changeView($: EngineInterface, change: (v: View) => View) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const held = await $.state.get(VIEW)
-    const before = held.value && Array.isArray(held.value.open) ? held.value : EMPTY_VIEW
-    const { isSet } = await $.state.set(VIEW, change(before), { ifVersion: held.version })
-    if (isSet) return
-  }
+  await serially(async () => {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const held = await $.state.get(VIEW)
+      const before = held.value && Array.isArray(held.value.open) ? held.value : EMPTY_VIEW
+      const { isSet } = await $.state.set(VIEW, change(before), { ifVersion: held.version })
+      if (isSet) return
+    }
+  })
 }
 
 async function setPlan($: EngineInterface, loop: string, change: (p: Plan) => Plan) {
@@ -194,9 +220,17 @@ async function refreshAgents($: EngineInterface) {
     let changed = false
     const rows = b.agents.map(row => {
       const info = live.find(a => a.id === row.id)
-      if (!info || info.status === row.status) return row
+      if (!info) {
+        // The engine drops an agent's entry some time after it ends. One it no
+        // longer lists, and that we still think is working, has ended: without
+        // this it would read "running" forever.
+        if (ENDED.has(row.status) || now - row.startedAt < GRACE_MS) return row
+        changed = true
+        return { ...row, status: 'completed', endedAt: now, endedBy: 'gone' as const }
+      }
+      if (info.status === row.status) return row
       changed = true
-      return { ...row, status: info.status, endedAt: ENDED.has(info.status) ? now : undefined }
+      return { ...row, status: info.status, endedAt: ENDED.has(info.status) ? (row.endedAt ?? now) : undefined, endedBy: ENDED.has(info.status) ? (row.endedBy ?? ('list' as const)) : undefined }
     })
     for (const info of live) {
       if (rows.some(r => r.id === info.id)) continue
@@ -223,7 +257,7 @@ async function refreshTasks($: EngineInterface) {
   for (const task of b.tasks) {
     if (task.status !== 'running') continue
     if (task.kind === 'monitor' && task.timeoutMs && now - task.startedAt > task.timeoutMs) {
-      updates[task.id] = { status: 'completed', endedAt: task.startedAt + task.timeoutMs }
+      updates[task.id] = { status: 'completed', endedAt: task.startedAt + task.timeoutMs, endedBy: 'timeout' }
       continue
     }
     if (!task.outputPath) continue
@@ -247,6 +281,79 @@ async function refreshTasks($: EngineInterface) {
     ...board,
     tasks: board.tasks.map(t => (updates[t.id] ? { ...t, ...updates[t.id] } : t)),
   }))
+}
+
+// ── Evidence that work ended ─────────────────────────────────────────────
+// Signals the engine already sends, so the model is never asked for more.
+
+/** An agent's run ended (its report reached the parent, or a notification said so). */
+async function endAgent($: EngineInterface, id: string, status: string, by: AgentRow['endedBy']) {
+  const now = await $.clock.now()
+  await changeBoard($, b => {
+    const row = b.agents.find(a => a.id === id)
+    if (!row || (ENDED.has(row.status) && row.status === status)) return b
+    return { ...b, agents: b.agents.map(a => (a.id === id ? { ...a, status, endedAt: a.endedAt ?? now, endedBy: by } : a)) }
+  })
+}
+
+/** Task statuses as notifications word them, in the board's words. */
+function taskStatus(word: string): BgTask['status'] {
+  return word === 'failed' || word === 'error' ? 'failed' : word === 'killed' || word === 'stopped' || word === 'cancelled' ? 'stopped' : 'completed'
+}
+
+/**
+ * Reads the ids and statuses out of a background task's notification
+ * (`<task-id>…</task-id>` … `<status>…</status>`), one or several.
+ */
+function parseNotifications(text: string): { id: string; status: string }[] {
+  const found: { id: string; status: string }[] = []
+  const blocks = text.split(/<task-notification>/i).slice(1)
+  for (const block of blocks.length > 0 ? blocks : [text]) {
+    const id = /<task[-_]id>\s*([^<\s]+)\s*<\/task[-_]id>/i.exec(block)?.[1]
+    const status = /<status>\s*([^<]+?)\s*<\/status>/i.exec(block)?.[1]?.toLowerCase()
+    if (id && status) found.push({ id, status })
+  }
+  return found
+}
+
+/** A notification said these tasks or agents ended. */
+async function endByNotification($: EngineInterface, ended: { id: string; status: string }[]) {
+  const done = ended.filter(n => n.status !== 'running' && n.status !== 'pending')
+  if (done.length === 0) return
+  const now = await $.clock.now()
+  await changeBoard($, b => {
+    let changed = false
+    const tasks = b.tasks.map(t => {
+      const n = done.find(x => x.id === t.id)
+      if (!n || t.status !== 'running') return t
+      changed = true
+      return { ...t, status: taskStatus(n.status), endedAt: now, endedBy: 'notification' as const }
+    })
+    const agents = b.agents.map(a => {
+      const n = done.find(x => x.id === a.id)
+      if (!n || ENDED.has(a.status)) return a
+      changed = true
+      const status = n.status === 'failed' ? 'failed' : n.status === 'killed' || n.status === 'stopped' ? 'killed' : 'completed'
+      return { ...a, status, endedAt: now, endedBy: 'notification' as const }
+    })
+    return changed ? { ...b, tasks, agents } : b
+  })
+}
+
+/**
+ * At a turn's end the engine lists the background work still in flight,
+ * session-wide: a task of ours it no longer lists has ended.
+ */
+async function reconcileTasks($: EngineInterface, running: unknown) {
+  if (!Array.isArray(running)) return
+  const live = new Set(running.map(t => (t && typeof t === 'object' ? String((t as { id?: unknown }).id) : '')))
+  const now = await $.clock.now()
+  await changeBoard($, b => {
+    const gone = b.tasks.filter(t => t.status === 'running' && !live.has(t.id) && now - t.startedAt >= GRACE_MS / 2)
+    if (gone.length === 0) return b
+    const ids = new Set(gone.map(t => t.id))
+    return { ...b, tasks: b.tasks.map(t => (ids.has(t.id) ? { ...t, status: 'completed', endedAt: now, endedBy: 'turn-end' as const } : t)) }
+  })
 }
 
 /** Sends what the pane queued, by the quickest route the target allows right now. */
@@ -564,7 +671,20 @@ async function sendNote($: EngineInterface, target: Target, key: string, note: s
 
 // ── Hooks ────────────────────────────────────────────────────────────────
 
-export const register: Register = on => {
+/** Opens the pane, and says in words why when it cannot be drawn now. */
+async function openPane($: EngineInterface): Promise<string> {
+  try {
+    const opened = await $.ui.open({ id: PANE, title: TITLE })
+    return opened.isPlaced ? 'Headway pane opened.' : `Headway pane is open but not drawn yet: ${opened.reason}`
+  } catch (err) {
+    return `Headway could not open its pane: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+export const register: Register = (on, options) => {
+  const configured = Number(options?.staleMinutes)
+  const staleMs = (Number.isFinite(configured) && configured > 0 ? configured : STALE_MINUTES) * 60_000
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     sessionId = await $.session.id()
@@ -572,6 +692,10 @@ export const register: Register = on => {
     await $.command.register({
       name: 'headway',
       description: 'Show progress on this session’s plan, its subagents, background tasks and your other sessions',
+      argumentHint: '[clear]',
+      // Runs at once, mid-turn too: left out, `/headway` typed during a long
+      // turn waited for the turn to end, so a closed pane seemed not to reopen.
+      immediate: true,
     })
     await $.tool.register({
       name: 'report_progress',
@@ -580,7 +704,7 @@ export const register: Register = on => {
       inputSchema: REPORT_SCHEMA as unknown as Record<string, unknown>,
       isDeferred: false,
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    void openPane($)
     const stored = (await $.store.get('history')) as Record<string, number[]> | undefined
     if (stored && typeof stored === 'object') await $.state.set(HISTORY, stored)
 
@@ -633,8 +757,8 @@ export const register: Register = on => {
       await changeBoard($, () => EMPTY_BOARD)
       return { text: 'Headway cleared this session’s board.' }
     }
-    await $.ui.open({ id: PANE, title: TITLE })
-    return { text: 'Headway pane opened. `/headway clear` resets this session’s board.' }
+    const said = await openPane($)
+    return { text: `${said} \`/headway clear\` resets this session’s board.` }
   })
 
   // Every tool call: the activity timeline, plans, background tasks, and the
@@ -710,6 +834,22 @@ export const register: Register = on => {
       sized = applied.sized
       return applied.plan
     })
+    // A subagent with no plan of its own: its report belongs to its own row.
+    if (!matched && sized === 0 && e.agentId && (report.percent !== undefined || report.note || report.subSteps)) {
+      const agentId = e.agentId
+      let found = false
+      await changeBoard($, b => {
+        if (!b.agents.some(a => a.id === agentId)) return b
+        found = true
+        return {
+          ...b,
+          agents: b.agents.map(a =>
+            a.id === agentId ? { ...a, report: { percent: report.percent ?? a.report?.percent, note: report.note ?? a.report?.note, subSteps: report.subSteps ?? a.report?.subSteps, at } } : a,
+          ),
+        }
+      })
+      if (found) return { result: 'Recorded on this subagent’s row. The user sees it in the Headway pane.' }
+    }
     const said = [sized > 0 && `Sized ${sized} step${sized === 1 ? '' : 's'}.`, matched && `Recorded on “${matched}”.`].filter(Boolean)
     return {
       result:
@@ -745,19 +885,31 @@ export const register: Register = on => {
 
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
-    const running = e.background_tasks
-    if (Array.isArray(running)) {
-      const live = new Set(running.map(t => t.id))
-      const now = await $.clock.now()
-      await changeBoard($, b => {
-        const gone = b.tasks.filter(t => t.status === 'running' && t.loop === MAIN && !live.has(t.id))
-        if (gone.length === 0) return b
-        const ids = new Set(gone.map(t => t.id))
-        return { ...b, tasks: b.tasks.map(t => (ids.has(t.id) ? { ...t, status: 'completed', endedAt: now } : t)) }
-      })
-    }
+    await reconcileTasks($, e.background_tasks)
     return result
   }).catch(($, e, next) => next(e)) // never hold the turn's end over a headway bug
+
+  // A subagent's turn ending carries the same session-wide list: more chances
+  // to see a background task end while the main turn runs on.
+  on('classic.SubagentStop', async ($, e, next) => {
+    const result = await next(e)
+    await reconcileTasks($, e.background_tasks)
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // An agent's run ended: its report is on its way to the parent.
+  on('agent.report', async ($, e, next) => {
+    const result = await next(e)
+    await endAgent($, e.agentId, e.status === 'stopped' ? 'killed' : e.status, 'report')
+    return result
+  }).catch(($, e, next) => next(e)) // never hold a report over a headway bug
+
+  // A background task's notification says how it ended, as it arrives.
+  on('prompt.submit', async ($, e, next) => {
+    const origin = (e as unknown as { origin?: { kind?: string } }).origin
+    if (origin?.kind === 'task-notification' || /<task-notification>/i.test(e.text)) await endByNotification($, parseNotifications(e.text))
+    return next(e)
+  }).catch(($, e, next) => next(e)) // never hold a prompt over a headway bug
 
   // Subagents, nested under the step their parent was on when it spawned them.
   on('agent.spawn', async ($, e, next) => {
@@ -783,6 +935,25 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
+    // A drawing that throws makes the engine close the pane, and every reopen
+    // would draw the same board and close it again. So a fault draws a plain
+    // fallback instead, with a way out, and the pane stays.
+    try {
+      return await drawPane()
+    } catch (err) {
+      const { Box, Text, Button } = table
+      return (
+        <Box flexDirection="column" gap="sm" paddingX="xs" paddingY="xs">
+          <Text weight="semibold">Headway hit a problem drawing this board.</Text>
+          <Text size="caption" dimColor wrap="wrap">
+            {err instanceof Error ? err.message : String(err)}
+          </Text>
+          <Button key="reset-board" label="Clear the board" onPress={() => void changeBoard($, () => EMPTY_BOARD)} />
+        </Box>
+      )
+    }
+
+    async function drawPane() {
     const { Box, Text, Button } = table
     // The terminal is the one surface without SVG; it gets lines of rules and no ⓘ.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
@@ -1021,9 +1192,12 @@ export const register: Register = on => {
           <Box flexDirection="column" gap="xs" flexGrow={1} flexShrink={1} minWidth={0}>
             <Box flexDirection="row" gap="sm" alignItems="center">
               <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                <Text weight={opts.strong ? 'semibold' : 'regular'} dimColor={opts.faded} wrap="truncate-end">
-                  {name}
-                </Text>
+                {/* The whole name opens and closes the row, not just the ▸ beside it. */}
+                <Button key={`open:${key}`} plain onPress={() => void toggle($, key)}>
+                  <Text weight={opts.strong ? 'semibold' : 'regular'} dimColor={opts.faded} wrap="truncate-end">
+                    {name}
+                  </Text>
+                </Button>
               </Box>
               {opts.tag && (
                 <Text size="caption" color="suggestion" weight="medium">
@@ -1062,6 +1236,122 @@ export const register: Register = on => {
       measured: 'measured',
       history: 'past sessions',
       sized: 'unchecked guess',
+    }
+
+    // ── Steps: keys, evidence, details ──────────────────────────────────
+
+    // Two steps of one name still get keys of their own.
+    const keyed = new Map<Step, string>()
+    const seenKeys = new Map<string, number>()
+    for (const s of steps) {
+      const base = `step:${s.content}`
+      const n = (seenKeys.get(base) ?? 0) + 1
+      seenKeys.set(base, n)
+      keyed.set(s, n === 1 ? base : `${base}#${n}`)
+    }
+    const stepKey = (s: Step) => keyed.get(s) ?? `step:${s.content}`
+    const active = activeStep(main)
+
+    /** The last sign of work on a step: its own evidence, and the main turn while it runs on its active step. */
+    const signalOf = (step: Step) => {
+      const at = stepSignalAt(step, b.activity, b.agents, b.tasks)
+      return at !== undefined && b.turn.running && step.content === active ? Math.max(at, b.turn.startedAt ?? 0) : at
+    }
+
+    /**
+     * A step still marked in progress with nothing working on it and no sign
+     * of work for `staleMinutes` reads "stale?": it may have finished without
+     * being checked off. A running subagent, task or tool call on it keeps it live.
+     */
+    const staleness = (step: Step): { quietMs: number } | undefined => {
+      if (step.status !== 'in_progress') return undefined
+      const isLive =
+        b.agents.some(a => a.step === step.content && !ENDED.has(a.status)) ||
+        b.tasks.some(t => t.step === step.content && t.status === 'running') ||
+        b.activity.some(a => a.step === step.content && a.endedAt === undefined)
+      if (isLive) return undefined
+      const at = signalOf(step)
+      if (at === undefined || now - at <= staleMs) return undefined
+      return { quietMs: now - at }
+    }
+
+    const stepFacts = (step: Step, stale: { quietMs: number } | undefined) => {
+      if (step.status === 'pending') return 'Not started.'
+      if (step.status === 'completed') {
+        const when = step.completedAt !== undefined ? `Done ${ago(now - step.completedAt)}` : 'Done'
+        return step.closedBy === 'report' ? `${when} · closed by its own report` : when
+      }
+      const signal = signalOf(step)
+      return [
+        step.startedAt !== undefined && `Started ${ago(now - step.startedAt)}`,
+        signal !== undefined && `last sign of work ${ago(now - signal)}`,
+        stale && 'stale?',
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    }
+
+    /**
+     * Each part with a bar of its own: done parts full, a part's own percent
+     * where reported, else the part in progress takes what the step's percent
+     * leaves after the done ones (pale, at half, with no percent at all).
+     */
+    const subStepList = (key: string, step: Step, subs: SubStep[]) => {
+      const done = subs.filter(x => x.status === 'completed').length
+      const fromStep = step.percent !== undefined ? Math.min(1, Math.max(0, (step.percent / 100) * subs.length - done)) : undefined
+      return (
+        <Box flexDirection="column" gap="xs">
+          {subs.map((x, i) => {
+            const measured = x.status === 'completed' ? 1 : x.percent !== undefined ? x.percent / 100 : x.status === 'in_progress' && fromStep ? fromStep : 0
+            const guessed = x.status === 'in_progress' && measured === 0 ? 0.5 : 0
+            const words =
+              x.status === 'completed' ? 'done' : measured > 0 ? `${Math.round(measured * 100)}%` : x.status === 'in_progress' ? 'in progress' : 'not started'
+            advance(LINE)
+            return (
+              <Box key={`sub:${key}:${i}`} flexDirection="column">
+                <Box flexDirection="row" gap="sm">
+                  <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                    <Text size="footnote" dimColor={x.status !== 'in_progress'} wrap="truncate-end">
+                      {x.status === 'completed' ? '✓' : x.status === 'in_progress' ? '●' : '○'} {x.content}
+                    </Text>
+                  </Box>
+                  <Text size="caption" mono dimColor>
+                    {words}
+                  </Text>
+                </Box>
+                {rowBar({ done: measured, estimate: guessed, isComplete: x.status === 'completed' })}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+
+    /** A step a later plan dropped: what it was, and why it left. */
+    const archivedStepRow = (step: ArchivedStep, i: number) => {
+      const key = `archived:${i}:${step.content}`
+      const isDone = step.reason === 'done'
+      const head = rowLine(key, isDone ? '✓' : '⤳', isDone ? 'success' : 'subtle', step.content, {
+        faded: true,
+        right: isDone ? 'done' : 'superseded',
+      })
+      const subs = step.subSteps ?? []
+      const body = isOpen(key) ? (
+        <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+          {caption(
+            isDone
+              ? `Finished, then left out of a later plan ${ago(now - step.archivedAt)}.`
+              : `A later plan replaced it ${ago(now - step.archivedAt)}, before it was checked off${step.status === 'in_progress' ? ' (it was in progress)' : ''}.`,
+          )}
+          {subs.length > 0 && subStepList(key, step, subs)}
+        </Box>
+      ) : null
+      return (
+        <Box key={key} flexDirection="column">
+          {head}
+          {body}
+        </Box>
+      )
     }
 
     // ── Rows ────────────────────────────────────────────────────────────
@@ -1116,20 +1406,44 @@ export const register: Register = on => {
       const target: Target = { kind: 'loop', loop: row.id, label: row.description }
       const aeta = !ended ? planEta(plan, actx) : undefined
       const frac = planFraction(plan, actx)
+      const said = row.report
+      const saidFrac = said?.percent !== undefined ? said.percent / 100 : said?.subSteps?.length ? said.subSteps.filter(x => x.status === 'completed').length / said.subSteps.length : undefined
       const stuck = hl === 'quiet' || hl === 'slow'
       const right = ended ? `${row.type} · ${duration(elapsed)}` : aeta && aeta.basis !== 'none' ? `${range(aeta)}` : `${row.type} · ${duration(elapsed)}`
       const head = rowLine(key, mark, color, row.description, {
         faded: ended,
-        mini: p.total > 0 ? { done: frac.measured, estimate: frac.estimated, isComplete: p.done === p.total, tone: toneOf(hl) } : undefined,
+        mini:
+          p.total > 0
+            ? { done: frac.measured, estimate: frac.estimated, isComplete: p.done === p.total, tone: toneOf(hl) }
+            : saidFrac !== undefined
+              ? { done: saidFrac, estimate: 0, isComplete: ended || saidFrac >= 1, tone: toneOf(hl) }
+              : undefined,
         miniTip: [
-          `${p.done} of ${p.total} of its own steps done.`,
+          p.total > 0 ? `${p.done} of ${p.total} of its own steps done.` : saidFrac !== undefined ? `${Math.round(saidFrac * 100)}%, as it reported ${ago(now - (said?.at ?? now))}.` : '',
           aeta && aeta.basis !== 'none' ? `About ${range(aeta)} left, from ${basisWords(aeta.basis, calibrate(plan, actx))}.` : 'No estimate for its remaining steps yet.',
         ],
         right,
       })
-      const trouble = !ended && hl !== 'on-track' && hl !== 'idle' ? caption(`${HEALTH[hl].label}: ${HEALTH[hl].meaning}`, HEALTH[hl].color) : null
+      const trouble =
+        !ended && hl !== 'on-track' && hl !== 'idle'
+          ? caption(`${HEALTH[hl].label}: ${HEALTH[hl].meaning}`, HEALTH[hl].color)
+          : !ended && said?.note
+            ? caption(said.note)
+            : null
+      const endWords =
+        row.endedBy === 'gone'
+          ? 'Ended: the engine no longer lists it.'
+          : row.endedBy === 'report'
+            ? `Ended ${ago(now - (row.endedAt ?? now))}: its report reached its parent.`
+            : row.endedBy === 'notification'
+              ? `Ended ${ago(now - (row.endedAt ?? now))}: a task notification said ${row.status}.`
+              : ended
+                ? `Ended ${ago(now - (row.endedAt ?? now))}.`
+                : undefined
       const body = isOpen(key) ? (
         <Box flexDirection="column" gap="xs" marginLeft="lg" marginTop="xs">
+          {endWords && caption(endWords)}
+          {(!plan || plan.steps.length === 0) && said?.subSteps && said.subSteps.length > 0 && subStepList(key, { content: row.description, status: 'in_progress', percent: said.percent }, said.subSteps)}
           {plan && plan.steps.length > 0 && (
             <Box flexDirection="column">
               {plan.steps.map(s => {
@@ -1170,18 +1484,21 @@ export const register: Register = on => {
     }
 
     const stepRow = (step: Step) => {
-      const key = `step:${step.content}`
+      const key = stepKey(step)
       const est = estimateStep(step, model, ctx)
       const isCurrent = step.status === 'in_progress'
-      const hl: Health = isCurrent ? mainH : 'on-track'
       const agents = b.agents.filter(a => !a.parentId && a.step === step.content)
       const tasks = b.tasks.filter(t => t.step === step.content)
       const acts = b.activity.filter(a => a.loop === MAIN && a.step === step.content)
+      const stale = staleness(step)
+      const hl: Health = isCurrent ? (stale && mainH !== 'needs-you' ? 'quiet' : mainH) : 'on-track'
       const target: Target = { kind: 'loop', loop: MAIN, label: step.content }
-      const mark = step.status === 'completed' ? '✓' : isCurrent ? '●' : '○'
-      const markColor = step.status === 'completed' ? 'success' : isCurrent ? (hl === 'on-track' || hl === 'idle' ? 'claude' : HEALTH[hl].color) : 'subtle'
+      const mark = step.status === 'completed' ? '✓' : stale ? '◌' : isCurrent ? '●' : '○'
+      const markColor = step.status === 'completed' ? 'success' : stale ? 'warning' : isCurrent ? (hl === 'on-track' || hl === 'idle' ? 'claude' : HEALTH[hl].color) : 'subtle'
       const right =
-        step.status === 'completed'
+        stale
+          ? `stale? · ${duration(stale.quietMs)}`
+          : step.status === 'completed'
           ? step.isBatch || est.activeMs < 1000
             ? 'done'
             : duration(est.activeMs)
@@ -1219,6 +1536,7 @@ export const register: Register = on => {
                     : 'No estimate for this step yet.',
                 'Working time only: the clock stops while the session waits on you.',
               ]
+      if (stale) barTip.unshift(`No sign of work for ${duration(stale.quietMs)}: no tool call, report, subagent or task on it. It may have finished without being checked off.`)
       const head = rowLine(key, mark, markColor, step.content, {
         strong: isCurrent,
         faded: step.status === 'completed',
@@ -1234,18 +1552,35 @@ export const register: Register = on => {
       })
       const summary = step.blocker
         ? caption(`Blocked: ${step.blocker}`, 'error')
+        : stale
+          ? caption(`Stale? No sign of work for ${duration(stale.quietMs)}: it may be done but never checked off.`, 'warning')
         : isCurrent && hl !== 'on-track' && hl !== 'idle'
           ? caption(`${HEALTH[hl].label}: ${HEALTH[hl].meaning}`, HEALTH[hl].color)
           : isCurrent && (subs.length > 0 || step.note)
             ? caption([subs.length > 0 && `${subsDone}/${subs.length} parts`, step.note].filter(Boolean).join(' · '))
             : null
-      const nested = agents.length + tasks.length
+      const agentsLive = agents.filter(a => !ENDED.has(a.status)).length
+      const tasksLive = tasks.filter(t => t.status === 'running').length
+      const finished = agents.length - agentsLive + tasks.length - tasksLive
       const nestedLine =
-        !isOpen(key) && nested > 0
-          ? caption([agents.length > 0 && `${agents.length} subagent${agents.length === 1 ? '' : 's'}`, tasks.length > 0 && `${tasks.length} background task${tasks.length === 1 ? '' : 's'}`].filter(Boolean).join(' · '))
+        !isOpen(key) && agents.length + tasks.length > 0
+          ? caption(
+              [
+                agentsLive > 0 && `${agentsLive} subagent${agentsLive === 1 ? '' : 's'}`,
+                tasksLive > 0 && `${tasksLive} background task${tasksLive === 1 ? '' : 's'}`,
+                finished > 0 && `${finished} finished`,
+              ]
+                .filter(Boolean)
+                .join(' · '),
+            )
           : null
       const overrun = isCurrent && (est.overByMs !== undefined || isSlipping)
-      const stepActions: Action[] = isCurrent
+      const stepActions: Action[] = stale
+        ? [
+            { label: 'Status check', run: () => void intervene($, 'status', target), primary: true },
+            { label: 'Add context', run: () => void compose($, key) },
+          ]
+        : isCurrent
         ? hl === 'needs-you'
           ? []
           : overrun
@@ -1272,18 +1607,8 @@ export const register: Register = on => {
           : []
       const body = isOpen(key) ? (
         <Box flexDirection="column" gap="sm" marginLeft="lg" marginTop="xs">
-          {subs.length > 0 && (
-            <Box flexDirection="column">
-              {subs.map(s => {
-                advance(LINE)
-                return (
-                  <Text key={`sub:${step.content}:${s.content}`} size="footnote" dimColor={s.status !== 'in_progress'} wrap="truncate-end">
-                    {s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '●' : '○'} {s.content}
-                  </Text>
-                )
-              })}
-            </Box>
-          )}
+          {caption(stepFacts(step, stale))}
+          {subs.length > 0 ? subStepList(key, step, subs) : step.status === 'in_progress' && caption('No parts reported for this step.')}
           {agents.map(a => agentRow(a))}
           {tasks.map(t => taskRow(t))}
           {step.status !== 'pending' && timeline(acts, step.startedAt)}
@@ -1308,9 +1633,16 @@ export const register: Register = on => {
     const overall = sessionHealth(b, now, history)
     const scope = describeScope(main, now)
     const stepNames = new Set(steps.map(s => s.content))
+    // What is finished, or was dropped, leaves its section for the Archive
+    // once it has been done a little while, so the sections hold live work.
+    const isOld = (endedAt: number | undefined) => endedAt === undefined || now - endedAt > RECENT_MS
     const loose = b.agents.filter(a => !a.parentId && (!a.step || !stepNames.has(a.step)))
+    const looseLive = loose.filter(a => !ENDED.has(a.status) || !isOld(a.endedAt))
     const tasksRunning = b.tasks.filter(t => t.status === 'running')
-    const tasksShown = [...tasksRunning, ...b.tasks.filter(t => t.status !== 'running').slice(-3)]
+    const tasksUntied = b.tasks.filter(t => !t.step || !stepNames.has(t.step))
+    const tasksShown = b.tasks.filter(t => t.status === 'running' || !isOld(t.endedAt))
+    const stepsShown = steps.filter(s => s.status !== 'completed' || !isOld(s.completedAt))
+    const stepsArchived = steps.filter(s => !stepsShown.includes(s))
     const latest = [...b.interventions].reverse().find(i => i.status === 'pending' || now - (i.deliveredAt ?? i.at) < 2 * 60_000)
     const spec: BarSpec = { done: frac.measured, estimate: frac.estimated, isComplete: p.total > 0 && p.done === p.total, tone: toneOf(overall) }
     const deliveredWords = (i: Intervention) =>
@@ -1453,15 +1785,16 @@ export const register: Register = on => {
 
     const stepList = steps.length > 0 && (
       <Box flexDirection="column" gap="xs">
-        {sectionLabel('Steps')}
-        {steps.map(step => stepRow(step))}
+        {sectionLabel('Steps', stepsArchived.length > 0 ? `${stepsArchived.length} done in Archive` : undefined)}
+        {stepsShown.map(step => stepRow(step))}
+        {stepsShown.length === 0 && caption('Every step is done.')}
       </Box>
     )
 
-    const subagents = loose.length > 0 && (
+    const subagents = looseLive.length > 0 && (
       <Box flexDirection="column" gap="xs">
         {sectionLabel('Subagents')}
-        {loose.map(row => agentRow(row))}
+        {looseLive.map(row => agentRow(row))}
       </Box>
     )
 
@@ -1474,16 +1807,16 @@ export const register: Register = on => {
 
     // ── Other sessions ──────────────────────────────────────────────────
 
-    const othersLabel = sectionLabel('Other sessions')
-    const othersBody =
-      others.length === 0 ? (
-        caption('None reporting yet. Sessions started since Headway was installed show up here.')
-      ) : (
-        <Box flexDirection="column" gap="sm">
-          {others.map(one => {
+    // Another session that finished, or has not reported in a while, is archived too.
+    const healthOf = (one: SessionSummary): Health => (one.health in HEALTH ? one.health : 'idle')
+    const isOtherOld = (one: SessionSummary) => healthOf(one) === 'done' || now - one.updatedAt > STALE_MS
+    const othersLive = others.filter(one => !isOtherOld(one))
+    const othersArchived = others.filter(isOtherOld)
+    const othersLabel = sectionLabel('Other sessions', othersArchived.length > 0 ? `${othersArchived.length} in Archive` : undefined)
+    const otherRow = (one: SessionSummary) => {
             const key = `session:${one.id}`
             const stale = now - one.updatedAt > STALE_MS
-            const hl: Health = stale && one.health !== 'done' ? 'idle' : one.health
+            const hl: Health = stale && healthOf(one) !== 'done' ? 'idle' : healthOf(one)
             const op: BarSpec = { done: one.total ? one.done / one.total : 0, estimate: 0, isComplete: one.total > 0 && one.done === one.total, tone: toneOf(hl) }
             const target: Target = { kind: 'session', summary: one, label: one.active ?? one.name }
             const stuck = hl === 'slow' || hl === 'quiet' || stale
@@ -1549,9 +1882,46 @@ export const register: Register = on => {
                 {body}
               </Box>
             )
-          })}
+    }
+    const othersBody =
+      othersLive.length === 0 ? (
+        caption(others.length === 0 ? 'None reporting yet. Sessions started since Headway was installed show up here.' : 'None working right now.')
+      ) : (
+        <Box flexDirection="column" gap="sm">
+          {othersLive.map(one => otherRow(one))}
         </Box>
       )
+
+    // ── Archive ─────────────────────────────────────────────────────────
+    // Finished, dropped and stale-by-age work, newest first, collapsed until
+    // its header is pressed.
+
+    type Archived = { at: number; draw: () => ReturnType<typeof h> }
+    const dropped = (main?.archived ?? []).map((s, i): Archived => ({ at: s.archivedAt, draw: () => archivedStepRow(s, i) }))
+    const archivedItems: Archived[] = [
+      ...stepsArchived.map(s => ({ at: s.completedAt ?? 0, draw: () => stepRow(s) })),
+      ...dropped,
+      ...loose.filter(a => !looseLive.includes(a)).map(a => ({ at: a.endedAt ?? a.startedAt, draw: () => agentRow(a) })),
+      ...tasksUntied.filter(t => !tasksShown.includes(t)).map(t => ({ at: t.endedAt ?? t.startedAt, draw: () => taskRow(t) })),
+      ...othersArchived.map(one => ({ at: one.updatedAt, draw: () => otherRow(one) })),
+    ].sort((x, z) => z.at - x.at)
+    const ARCHIVE_SHOWN = 40
+    const archiveOpen = isOpen('archive')
+    advance(LINE)
+    const archive = archivedItems.length > 0 && (
+      <Box key="archive" flexDirection="column" gap="xs">
+        <Button key="toggle:archive" plain onPress={() => void toggle($, 'archive')}>
+          <Text size="caption" weight="semibold" dimColor>
+            {archiveOpen ? '▾' : '▸'} ARCHIVE
+          </Text>
+          <Text size="caption" dimColor>
+            {` · ${archivedItems.length}`}
+          </Text>
+        </Button>
+        {archiveOpen && archivedItems.slice(0, ARCHIVE_SHOWN).map(item => item.draw())}
+        {archiveOpen && archivedItems.length > ARCHIVE_SHOWN && caption(`${archivedItems.length - ARCHIVE_SHOWN} older not shown`)}
+      </Box>
+    )
 
     return (
       <Box flexDirection="column" gap="lg" paddingX="xs" paddingY="xs" width="100%">
@@ -1563,8 +1933,10 @@ export const register: Register = on => {
           {othersLabel}
           {othersBody}
         </Box>
+        {archive}
       </Box>
     )
+    }
   })
 }
 

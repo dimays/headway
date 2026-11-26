@@ -23,7 +23,7 @@ type Dollar = Parameters<TestBody>[0]
 type On = Parameters<TestBody>[1]
 
 // Nothing sits beneath the plugin in a test: these hooks stand for the engine.
-function engine(on: On, store: Map<string, unknown> | undefined = undefined) {
+function engine(on: On, store: Map<string, unknown> | undefined = undefined, own: string[] = []) {
   const clock = mock.clock(on, { now: 1_000_000 })
   if (store) {
     // A store the test can look into, for what the session publishes.
@@ -35,14 +35,15 @@ function engine(on: On, store: Map<string, unknown> | undefined = undefined) {
     mock.store(on)
   }
   const submitted: string[] = []
-  on('command.register', () => ({ value: { command: 'headway' } }))
+  // A test that answers one of these itself names it in `own`.
+  if (!own.includes('command.register')) on('command.register', () => ({ value: { command: 'headway' } }))
   on('tool.register', () => ({ value: { tool: 'mcp__headway__report_progress' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  if (!own.includes('ui.open')) on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.root', () => ({ value: '/work/demo' }))
   on('tool.call', () => ({ result: {} }))
-  on('agent.list', () => ({ value: [] }))
+  if (!own.includes('agent.list')) on('agent.list', () => ({ value: [] }))
   on('prompt.submit', (_, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -222,6 +223,9 @@ test('finished steps give a measured estimate, labelled as such', async ($, on) 
   const status = (await ui.find({ key: 'status' }))?.text
   // No turn is running, so the time is work left, with the clock stopped.
   expect(status).toMatch(/~3–6 min of work left · measured/)
+  // A finished a while ago, so it waits in the Archive, collapsed.
+  expect(await ui.find({ key: 'step:A' })).toBeUndefined()
+  await ui.press({ key: 'toggle:archive' })
   expect((await ui.find({ key: 'step:A' }))?.text).toContain('✓A2m')
   expect((await ui.find({ key: 'step:E' }))?.text).toContain('~2m')
   await ui.unmount()
@@ -538,4 +542,253 @@ test("a session goes by its title, not its folder, which the app may have reused
   const mine = store.get('session:session-1') as { name: string; root: string } | undefined
   expect(mine?.name).toBe('2.1.0 release planning')
   expect(mine?.root).toBe('/work/demo')
+})
+
+// ── v0.4: reopening, capture, closure, archive, drill-down ────────────
+
+test('/headway runs at once, mid-turn too, and reopens a closed pane', async ($, on) => {
+  const registered: Record<string, unknown>[] = []
+  const opened: string[] = []
+  on('command.register', (_, e) => (registered.push(e as unknown as Record<string, unknown>), { value: { command: 'headway' } }))
+  on('ui.open', (_, e) => (opened.push(e.id), { value: { isPlaced: true } }))
+    engine(on, undefined, ['command.register', 'ui.open'])
+  await start($)
+  // Left out, a command typed during a long turn waits for the turn to end.
+  expect(registered[0]?.immediate).toBe(true)
+  // After the person closes the pane, the command opens it again.
+  const ran = await $.command.run({ command: 'headway', args: '' } as Parameters<typeof $.command.run>[0])
+  expect(ran.text).toContain('Headway pane opened.')
+  expect(opened.filter(id => id === 'headway').length).toBe(2)
+})
+
+test('/headway says why when the pane cannot be drawn yet', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'the terminal is 90 columns wide' } }))
+  engine(on, undefined, ['ui.open'])
+  await start($)
+  const ran = await $.command.run({ command: 'headway', args: '' } as Parameters<typeof $.command.run>[0])
+  expect(ran.text).toContain('not drawn yet: the terminal is 90 columns wide')
+})
+
+test('a board the pane cannot draw shows a way out instead of closing the pane', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  on('session.root', () => ({ value: '/work/demo' }))
+  // A step whose parts are not a list: drawing it throws.
+  const broken = {
+    plans: { main: { steps: [{ content: 'Build', status: 'in_progress', startedAt: 900_000, subSteps: 'oops' }], changes: [], peak: 1, createdAt: 900_000, updatedAt: 900_000 } },
+    agents: [],
+    activity: [],
+    tasks: [],
+    interventions: [],
+    turn: { running: false },
+  }
+  on('state.get', (_, e) => ({ value: { value: (e as { key: string }).key === 'board' ? { shape: 'board-2', value: broken } : undefined, version: 1 } }))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /problem drawing this board/ }))?.text).toBeDefined()
+  expect(await ui.find({ key: 'reset-board' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a burst of parallel updates from many subagents loses none', async ($, on) => {
+  let n = 0
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: `bg-${++n}` } }))
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Audit the content', 'Build the pipeline') })
+  const calls = Array.from({ length: 40 }, (_, i) =>
+    $.tool.call({ tool: 'Bash', command: `job ${i}`, description: `Job ${i}`, run_in_background: true, agentId: `agent-${i % 8}` } as Parameters<typeof $.tool.call>[0]),
+  )
+  await Promise.all(calls)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (let i = 1; i <= 40; i++) expect(await ui.find({ key: `task:bg-${i}` })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a report names its step loosely and still lands', async ($, on) => {
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Read the docs', 'Run the test suite', 'Ship the release') })
+  // Plural, filler words and case differ from the plan's wording.
+  let reply = await $.tool.call({ tool: REPORT, step: 'test suites', note: 'flaky one' })
+  expect(JSON.stringify(reply)).toContain('Recorded on “Run the test suite”')
+  // By number.
+  reply = await $.tool.call({ tool: REPORT, step: 'step 3', percent: 10 })
+  expect(JSON.stringify(reply)).toContain('Recorded on “Ship the release”')
+  // Sizes match the same way.
+  reply = await $.tool.call({ tool: REPORT, sizes: [{ step: 'docs', size: 'S' }, { step: 'Ship release', size: 'M' }] })
+  expect(JSON.stringify(reply)).toContain('Sized 2 steps')
+})
+
+test('a rewritten plan keeps a reworded step’s reports and time, and archives what it dropped', async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Fix reopen', 'Write docs', 'Old idea') })
+  await $.tool.call({ tool: REPORT, subSteps: [{ content: 'Find cause', status: 'completed' }, { content: 'Patch', status: 'in_progress' }] })
+  await clock.advance(MIN)
+  await $.tool.call({
+    tool: PLAN,
+    items: [
+      { content: 'Fix pane reopen', status: 'in_progress' },
+      { content: 'Write docs', status: 'pending' },
+      { content: 'Add tests', status: 'pending' },
+    ],
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Fix pane reopen' }))?.text).toContain('1/2 parts')
+  // The dropped step left the list for the Archive, collapsed by default.
+  expect(await ui.find({ key: 'archived:0:Old idea' })).toBeUndefined()
+  expect((await ui.find({ key: 'toggle:archive' }))?.text).toContain('ARCHIVE · 1')
+  await ui.press({ key: 'toggle:archive' })
+  expect((await ui.find({ key: 'archived:0:Old idea' }))?.text).toContain('superseded')
+  await ui.press({ key: 'toggle:archive' })
+  expect(await ui.find({ key: 'archived:0:Old idea' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a report of 100% or every part done closes its step; progress on a pending one starts it', async ($, on) => {
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Build', 'Test', 'Ship') })
+  await $.tool.call({ tool: REPORT, step: 'Build', percent: 100 })
+  await $.tool.call({ tool: REPORT, step: 'Test', subSteps: [{ content: 'Unit', status: 'in_progress' }] })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Build' }))?.text).toContain('✓Build')
+  expect((await ui.find({ key: 'step:Test' }))?.text).toContain('●Test')
+  await ui.unmount()
+  // The model's own advance then moves on from where the work really is.
+  await $.tool.call({ tool: PLAN, advance: true })
+  const after = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await after.find({ key: 'step:Test' }))?.text).toContain('✓Test')
+  expect((await after.find({ key: 'step:Ship' }))?.text).toContain('●Ship')
+  await after.unmount()
+})
+
+test('a step left in progress with no sign of work reads stale?, not in progress', async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Audit pages', 'Publish') })
+  await clock.advance(9 * MIN)
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Audit pages' }))?.text).toContain('●Audit pages')
+  await ui.unmount()
+
+  await clock.advance(3 * MIN)
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const row = (await ui.find({ key: 'step:Audit pages' }))?.text
+  expect(row).toContain('◌Audit pages')
+  expect(row).toContain('stale? · 12m')
+  expect(row).toContain('it may be done but never checked off')
+  await ui.press({ key: 'toggle:step:Audit pages' })
+  expect(await ui.find({ key: 'step:Audit pages:Status check' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('stale? waits as long as the staleMinutes option says', { options: { staleMinutes: 30 } }, async ($, on) => {
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Audit pages', 'Publish') })
+  await clock.advance(20 * MIN)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Audit pages' }))?.text).not.toContain('stale?')
+  await ui.unmount()
+})
+
+test('a running subagent keeps its step live, and its report ends it', async ($, on) => {
+  const { clock } = engine(on, undefined, ['agent.list'])
+  on('agent.list', () => ({ value: [{ id: 'agent-1', description: 'Audit section A', type: 'general-purpose', status: 'running' }] as never }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-1' }))
+  on('agent.report', (_, e) => ({ text: e.text }))
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Audit', 'Publish') })
+  await $.agent.spawn({ prompt: 'audit', description: 'Audit section A', subagentType: 'general-purpose' } as Parameters<typeof $.agent.spawn>[0])
+  await clock.advance(30 * MIN)
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Audit' }))?.text).not.toContain('stale?')
+  await ui.unmount()
+
+  await $.agent.report({ agentId: 'agent-1', subagentType: 'general-purpose', status: 'completed', text: 'done' } as Parameters<typeof $.agent.report>[0])
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'step:Audit' }))?.text).toContain('1 finished')
+  await ui.unmount()
+})
+
+test('a subagent the engine stopped listing is ended, not running forever', async ($, on) => {
+  const { clock } = engine(on)
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-9' }))
+  await start($)
+  // No plan: it is a loose subagent.
+  await $.agent.spawn({ prompt: 'x', description: 'Survey', subagentType: 'Explore' } as Parameters<typeof $.agent.spawn>[0])
+  let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'agent:agent-9' }))?.text).toContain('◐Survey')
+  await ui.unmount()
+  // agent.list answers [] (engine above): past the grace it reads ended,
+  // and once it has been done a while it moves to the Archive.
+  await clock.advance(5 * MIN)
+  ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'agent:agent-9' })).toBeUndefined()
+  await ui.press({ key: 'toggle:archive' })
+  expect((await ui.find({ key: 'agent:agent-9' }))?.text).toContain('✓Survey')
+  await ui.unmount()
+})
+
+test('a task notification ends its background task as it arrives', async ($, on) => {
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-7' } }))
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: 'Bash', command: 'make data', description: 'Build the data pipeline', run_in_background: true })
+  await $.prompt.submit({ text: '<task-notification>\n<task-id>bg-7</task-id>\n<status>failed</status>\n<summary>exit 1</summary>\n</task-notification>' } as Parameters<typeof $.prompt.submit>[0])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'task:bg-7' }))?.text).toContain('failed')
+  await ui.unmount()
+})
+
+test('a subagent’s turn end reconciles background tasks the main turn never saw end', async ($, on) => {
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-3' } }))
+  on('classic.SubagentStop', () => ({}))
+  const { clock } = engine(on)
+  await start($)
+  await $.tool.call({ tool: 'Bash', command: 'sleep 5', description: 'Wait a bit', run_in_background: true, agentId: 'agent-2' } as Parameters<typeof $.tool.call>[0])
+  await clock.advance(MIN)
+  await $.classic.SubagentStop({ agent_id: 'agent-2', agent_type: 'general-purpose', agent_transcript_path: '/t', stop_hook_active: false, background_tasks: [] } as unknown as Parameters<typeof $.classic.SubagentStop>[0])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'task:bg-3' }))?.text).toContain('completed')
+  await ui.unmount()
+})
+
+test('clicking a step’s name opens its parts, each with a bar, and clicking again closes it', async ($, on) => {
+  engine(on)
+  await start($)
+  await $.tool.call({ tool: PLAN, items: steps('Build the pane', 'Ship') })
+  await $.tool.call({
+    tool: REPORT,
+    percent: 50,
+    subSteps: [
+      { content: 'Layout', status: 'completed' },
+      { content: 'Bars', status: 'in_progress' },
+      { content: 'Buttons', status: 'pending', percent: 0 },
+    ],
+  })
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'sub:step:Build the pane:0' })).toBeUndefined()
+    await ui.press({ key: 'open:step:Build the pane' })
+    const layout = await ui.find({ key: 'sub:step:Build the pane:0' })
+    const bars = await ui.find({ key: 'sub:step:Build the pane:1' })
+    expect(layout?.text).toContain('Layout')
+    expect(layout?.text).toContain('done')
+    // Half the step done with one of three parts finished: the part in progress is at 50%.
+    expect(bars?.text).toContain('50%')
+    if (surface === 'desktop') expect(JSON.stringify(bars?.children)).toContain('"type":"Svg"')
+    expect((await ui.find({ key: 'sub:step:Build the pane:2' }))?.text).toContain('not started')
+    expect((await ui.find({ key: 'step:Build the pane' }))?.text).toContain('Started just now')
+    await ui.press({ key: 'open:step:Build the pane' })
+    expect(await ui.find({ key: 'sub:step:Build the pane:0' })).toBeUndefined()
+    await ui.unmount()
+  }
 })

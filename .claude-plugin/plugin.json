@@ -1,6 +1,6 @@
 {
   "name": "headway",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A live progress pane for Claude Code: nested progress bars, ETAs and health for plans, steps, subagents, background tasks and your other sessions, with buttons to steer the work.",
   "author": {
     "name": "David Mays",
@@ -16,5 +16,13 @@
     "subagents"
   ],
   "homepage": "https://github.com/dimays/headway",
-  "repository": "https://github.com/dimays/headway"
+  "repository": "https://github.com/dimays/headway",
+  "userConfig": {
+    "staleMinutes": {
+      "type": "number",
+      "title": "Minutes before a step reads stale?",
+      "description": "A step still marked in progress, with no tool call, report, subagent or task on it for this many minutes, is shown as \"stale?\" instead of in progress.",
+      "default": 10
+    }
+  }
 }
